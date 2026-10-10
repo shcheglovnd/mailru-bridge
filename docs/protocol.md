@@ -62,12 +62,34 @@ Outcome is in the **`X-SWA-STATUS`** response header
 | 723 | IMAP redirect (settings in `X-SWA-IMAPSETTINGS`) |
 
 ### SMS second step
-The app opens the `Continue` URL (with `client=mobile.app`) in a WebView; the page (a
-"Ludwig" SPA) takes the SMS code and finally redirects to the sentinel
-`https://mobile-auth/success`, where the app reads the tokens and a `tsa` cookie. The SPA's
-internal calls are **not yet recovered**; confirm them from a `--trace` run and tighten
-[`mailru_bridge/secondstep.py`](../mailru_bridge/secondstep.py). Statuses: `/success`,
-`/fail`, `/error` (`ru.mail.ui.webview.handler.MobileAuthUrlHandler`).
+On `808` the app opens the `Continue` URL `https://auth.mail.ru/cgi-bin/secstep?client=mobile.app`
+in a WebView. The page is a React app (`page2fa` bundle) whose state is embedded in the HTML
+as JSON: `csrf`, `secstep_login`, `secstep_phone` (masked), `force_sms_send_url`,
+`factor_choice_url`, `sms_enabled`, `ex_qrauth_enabled`, `ex_no_sms`. Recovered flow:
+
+1. **Load** `GET …/cgi-bin/secstep?client=mobile.app` (WebView UA; carries the `secstep`
+   cookie set on the `808`). Sets `secstep` + a first `tsa` cookie. **No SMS is sent here** —
+   when more than one factor exists the page opens on a factor-choice screen.
+2. **Send the code** `GET …/cgi-bin/secstep?client=mobile.app&send_sms=1` (`force_sms_send_url`).
+   *This* is what dispatches the SMS. Re-read `csrf` from the returned page.
+3. **Submit** `POST /cgi-bin/secstep` (plain form, `method=post`) with `csrf`, `Login`,
+   `AuthCode=<code>`, `Permanent=1` ("trust this device"). Code field is `AuthCode` for SMS
+   and TOTP, `calluiCode` for the call factor.
+4. The server redirects (caught, not fetched) to `https://mobile-auth/success` and sets a
+   now-**trusted** `tsa` cookie. `/fail` = wrong code, `/error` = server error
+   (`ru.mail.ui.webview.handler.MobileAuthUrlHandler`, `…feature.common.webview.CommonWebViewClient`).
+5. **Get tokens**: repeat the password `POST /cgi-bin/auth` carrying `Cookie: tsa=<value>`
+   (and the same `Login`/`Password`). The backend accepts the trusted device, skips the
+   second step and returns the OAuth tokens. This mirrors the app's
+   `CommonAuthorizationMailApi.getMailPasswordAuthorization(Login, Password, bind_token,
+   client_id, @Header Cookie, @FieldMap)` driven by `RequestMapper` →
+   `AuthRequestType.PasswordAuth(tsaCookie=…)`.
+
+The `tsa` cookie is long-lived (seen `expires` ≈ 90 days), so later logins send it on the
+first `/cgi-bin/auth` and skip the SMS entirely. Implemented in
+[`mailru_bridge/secondstep.py`](../mailru_bridge/secondstep.py); step 5 reuses
+`Authenticator.start_password`. **Pending one live `--trace` login to confirm the exact
+redirect chain and the token-response shape.**
 
 ### Refresh
 `POST https://o2.mail.ru/token`, form `client_id=mail-android`, `grant_type=refresh_token`,

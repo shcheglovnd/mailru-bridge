@@ -10,8 +10,11 @@
 - [x] `login` (password + SMS second step) and `status` CLI; token refresh.
 
 ### Next (needs a live account)
-- [ ] First traced login to pin the SMS second-step exchange, then tighten
-      `secondstep.py` to it.
+- [x] Pin the SMS second-step exchange from the first traced login + the app decompile
+      (`secstep` page JSON, `send_sms=1`, `AuthCode`/`csrf` POST, `mobile-auth/success`,
+      trusted-`tsa` re-login). Implemented in `secondstep.py`; see `protocol.md`.
+- [ ] Confirm it end to end with one more live `--trace` login (redirect chain + token
+      response shape), then lock it in.
 - [ ] Probe and document the read endpoints: folder list, message list, single-message
       fetch (incl. raw/RFC822 source if available), flags, move.
 - [ ] API client: folders, list, fetch, flags, move, delete, send.

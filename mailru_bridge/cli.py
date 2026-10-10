@@ -30,20 +30,32 @@ def _login(args: argparse.Namespace) -> int:
         with make_client(trace) as client:
             auth = Authenticator(client, account.device)
             password = getpass.getpass("Password: ")
-            result = auth.start_password(email, password, account.tsa_cookie)
-            del password
+            try:
+                result = auth.start_password(email, password, account.tsa_cookie)
 
-            if isinstance(result, SecondStepChallenge):
-                print("An SMS code was sent to your phone.", file=sys.stderr)
-                flow = SecondStepFlow(client, auth, trace)
-                page = flow.open_challenge(result.continue_url)
-                code = input("SMS code: ").strip()
-                outcome = flow.submit_code(page, code)
-                apply_tokens(account, outcome.tokens)
-                if outcome.tsa_cookie:
-                    account.tsa_cookie = outcome.tsa_cookie
-            else:
-                apply_tokens(account, result)
+                if isinstance(result, SecondStepChallenge):
+                    flow = SecondStepFlow(client, account.device, trace)
+                    page = flow.open_challenge(result.continue_url)
+                    page = flow.request_sms(page)  # this is what actually sends the SMS
+                    print(f"SMS code sent to {page.phone or 'your phone'}.", file=sys.stderr)
+                    code = input("SMS code: ").strip()
+                    outcome = flow.submit_code(page, email, code)
+                    if outcome.tsa_cookie:
+                        account.tsa_cookie = outcome.tsa_cookie
+                    # Re-run the password login as a now-trusted device: with the tsa cookie
+                    # the backend skips the second step and returns the OAuth tokens.
+                    client.cookies.clear()
+                    tokens = auth.start_password(email, password, account.tsa_cookie)
+                    if isinstance(tokens, SecondStepChallenge):
+                        raise AuthError(
+                            "Second step completed but the re-login still asks for a code; "
+                            "re-run with --trace and inspect it."
+                        )
+                    apply_tokens(account, tokens)
+                else:
+                    apply_tokens(account, result)
+            finally:
+                del password
 
         account.save()
     except (AuthError, SecondStepError) as exc:

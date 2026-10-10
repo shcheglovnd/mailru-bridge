@@ -1,126 +1,203 @@
-"""SMS second-step completion.
+"""SMS (and call/TOTP) second-step completion.
 
 After a password login returns :class:`~mailru_bridge.auth.SecondStepChallenge`, the
-official app opens the ``Continue`` URL in a WebView. That page (a "Ludwig" SPA on
-``auth.mail.ru``) collects the SMS code, verifies it, and finally redirects to the
-sentinel ``https://mobile-auth/success`` carrying the session; on it the app reads the
-account tokens and a ``tsa`` ("trusted device") cookie that lets later logins skip the SMS.
+official app opens the ``Continue`` URL (``/cgi-bin/secstep``) in a WebView. That page is a
+React app ("fauclient") whose state — a ``csrf`` token, the masked phone, and the URL that
+actually dispatches the SMS — is embedded in the HTML. Crucially the code is **not** sent
+just by loading the page: when an account has more than one factor (SMS, QR, call, TOTP)
+the page opens on a factor-choice screen, and the SMS goes out only when the user picks
+"by phone number", which navigates to ``force_sms_send_url`` (``…&send_sms=1``).
 
-The SPA's internal calls are not recovered from static analysis, so this module drives the
-flow against the live page: it follows the Continue URL, then submits the code to the form
-or JSON endpoint discovered there. Run the first login with ``--trace`` so the exact
-exchange is captured and this module can be tightened to it.
+So this module:
+
+1. loads the secstep page and reads its embedded state,
+2. GETs ``send_sms=1`` to make Mail.ru send the code,
+3. POSTs the code back to ``/cgi-bin/secstep`` as the page's form does
+   (fields ``csrf``, ``Login``, ``AuthCode``, ``Permanent``),
+4. lets the server redirect to the app sentinel ``https://mobile-auth/success`` and, on
+   the way, set a *trusted-device* ``tsa`` cookie.
+
+The caller then repeats the password login carrying that ``tsa`` cookie, which the backend
+accepts without a second step and answers with the OAuth tokens (this mirrors the app's
+own ``RequestMapper`` → ``PasswordAuth(tsaCookie=…)`` behaviour). The ``tsa`` cookie is
+long-lived, so later logins skip the SMS entirely.
+
+Field names and the flow are taken from the decompiled app (``CommonAuthorizationMailApi``,
+``CommonWebViewClient``, ``MobileAuthUrlHandler``) and from the page bundle ``page2fa``.
 """
 
 from __future__ import annotations
 
+import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 
-from .auth import Authenticator, Tokens
-from .device import USER_AGENT
+from .device import Device
 from .trace import Trace
 
-MOBILE_AUTH_SENTINEL = "mobile-auth"
+# The WebView treats this fake host as the end of the flow (MobileAuthUrlHandler).
+MOBILE_AUTH_HOST = "mobile-auth"
+SECSTEP_PATH = "/cgi-bin/secstep"
+# Used if the page does not spell out force_sms_send_url for some reason.
+DEFAULT_SMS_SEND_URL = f"{SECSTEP_PATH}?client=mobile.app&send_sms=1"
+
+
+class SecondStepError(Exception):
+    """The second step could not be completed (wrong code, server error, parse failure)."""
+
+
+@dataclass
+class SecstepPage:
+    """Parsed state of a ``/cgi-bin/secstep`` page."""
+
+    response: httpx.Response
+    csrf: str
+    login: str = ""
+    phone: str = ""
+    sms_send_url: str = DEFAULT_SMS_SEND_URL
+    factor_choice_url: str = ""
+    sms_enabled: bool = True
+
+    @property
+    def url(self) -> str:
+        return str(self.response.url)
 
 
 @dataclass
 class SecondStepOutcome:
-    tokens: Tokens
+    """Result of a completed second step. ``tsa_cookie`` unlocks SMS-free re-login."""
+
     tsa_cookie: str
+    additional_params: dict = field(default_factory=dict)
+    success_url: str = ""
 
 
-class SecondStepError(Exception):
-    pass
+def _field(html: str, key: str) -> str | None:
+    """Read a single ``"key":"value"`` string from the embedded JSON state."""
+    m = re.search(r'"' + re.escape(key) + r'"\s*:\s*"((?:[^"\\]|\\.)*)"', html)
+    if not m:
+        return None
+    try:
+        return json.loads('"' + m.group(1) + '"')  # unescape \/ \u.... etc.
+    except ValueError:
+        return m.group(1)
+
+
+def _flag(html: str, key: str) -> bool | None:
+    m = re.search(r'"' + re.escape(key) + r'"\s*:\s*"?(\d+)"?', html)
+    return bool(int(m.group(1))) if m else None
 
 
 class SecondStepFlow:
-    """Walks the Continue URL to the point where the SMS code is accepted.
+    """Drives the ``/cgi-bin/secstep`` page the way the app's WebView does."""
 
-    This is deliberately thin and defensive: it follows redirects by hand (so the final
-    ``mobile-auth`` redirect is caught, not fetched) and keeps every cookie the pages set.
-    The code-submission shape is confirmed on the first live, traced run.
-    """
-
-    def __init__(self, client: httpx.Client, auth: Authenticator, trace: Trace | None = None):
+    def __init__(self, client: httpx.Client, device: Device, trace: Trace | None = None):
         self.client = client
-        self.auth = auth
+        self.device = device
         self.trace = trace
 
-    def open_challenge(self, continue_url: str) -> httpx.Response:
-        """Load the second-step page, following in-site redirects and keeping cookies."""
-        url = continue_url
-        for _ in range(10):
-            resp = self.client.get(url, headers={"User-Agent": self.auth.device.webview_user_agent})
-            if resp.is_redirect:
-                location = resp.headers.get("location", "")
-                if MOBILE_AUTH_SENTINEL in location:
-                    return resp
-                url = str(httpx.URL(url).join(location))
-                continue
-            return resp
+    # -- steps -------------------------------------------------------------
+
+    def open_challenge(self, continue_url: str) -> SecstepPage:
+        """Load the second-step page (following in-site redirects) and parse its state."""
+        resp = self._follow_get(continue_url)
+        page = self._parse(resp)
+        if self.trace:
+            self.trace.note("secstep.open", has_csrf=bool(page.csrf), sms_enabled=page.sms_enabled)
+        return page
+
+    def request_sms(self, page: SecstepPage) -> SecstepPage:
+        """Ask Mail.ru to actually send the SMS, then re-read the (fresh) page state."""
+        url = str(httpx.URL(page.url).join(page.sms_send_url))
+        resp = self._follow_get(url)
+        fresh = self._parse(resp)
+        # Keep the phone/urls if the reloaded page omits them.
+        fresh.phone = fresh.phone or page.phone
+        fresh.sms_send_url = fresh.sms_send_url or page.sms_send_url
+        if self.trace:
+            self.trace.note("secstep.request_sms", status=resp.status_code)
+        return fresh
+
+    def submit_code(self, page: SecstepPage, email: str, code: str, permanent: bool = True) -> SecondStepOutcome:
+        """POST the code as the page's form does and wait for the success sentinel."""
+        if not page.csrf:
+            raise SecondStepError(
+                "No csrf token on the second-step page; re-run with --trace and inspect it."
+            )
+        data = {
+            "csrf": page.csrf,
+            "Login": page.login or email,
+            "AuthCode": code,
+            "Permanent": "1" if permanent else "0",
+        }
+        url = str(httpx.URL(page.url).join(SECSTEP_PATH))
+        resp = self.client.post(url, data=data, headers=self._headers())
+        return self._await_sentinel(resp)
+
+    # -- helpers -----------------------------------------------------------
+
+    def _headers(self) -> dict:
+        return {"User-Agent": self.device.webview_user_agent}
+
+    def _follow_get(self, url: str, limit: int = 10) -> httpx.Response:
+        """GET ``url`` following redirects by hand, stopping before the fake sentinel host."""
+        for _ in range(limit):
+            resp = self.client.get(url, headers=self._headers())
+            if not resp.is_redirect:
+                return resp
+            nxt = httpx.URL(str(resp.url)).join(resp.headers.get("location", ""))
+            if nxt.host == MOBILE_AUTH_HOST:
+                return resp
+            url = str(nxt)
         raise SecondStepError("Too many redirects loading the second-step page.")
 
-    def submit_code(self, page: httpx.Response, code: str) -> SecondStepOutcome:
-        """Submit the SMS code. Confirmed/adjusted from the first traced live run."""
-        action, fields = self._find_form(page)
-        if action is None:
-            raise SecondStepError(
-                "Could not locate the code form on the second-step page. "
-                "Re-run with --trace and share the captured page so the flow can be completed."
-            )
-        fields["code"] = code
-        url = str(httpx.URL(str(page.url)).join(action))
-        resp = self.client.post(
-            url, data=fields, headers={"User-Agent": self.auth.device.webview_user_agent}
-        )
-        return self._capture_result(resp)
-
-    def _capture_result(self, resp: httpx.Response) -> SecondStepOutcome:
-        for _ in range(10):
+    def _await_sentinel(self, resp: httpx.Response, limit: int = 10) -> SecondStepOutcome:
+        """Follow redirects after the code POST until the ``mobile-auth`` sentinel."""
+        for _ in range(limit):
             if resp.is_redirect:
-                location = resp.headers.get("location", "")
-                if MOBILE_AUTH_SENTINEL in location:
-                    tsa = self._cookie("tsa")
-                    tokens = self._tokens_from_redirect(httpx.URL(location))
-                    if tokens is None:
-                        raise SecondStepError(
-                            "Reached mobile-auth but found no tokens; inspect the trace."
-                        )
-                    return SecondStepOutcome(tokens, tsa)
-                resp = self.client.get(
-                    str(httpx.URL(str(resp.url)).join(location)),
-                    headers={"User-Agent": self.auth.device.webview_user_agent},
-                )
+                nxt = httpx.URL(str(resp.url)).join(resp.headers.get("location", ""))
+                if nxt.host == MOBILE_AUTH_HOST:
+                    return self._outcome(nxt)
+                resp = self.client.get(str(nxt), headers=self._headers())
                 continue
-            raise SecondStepError(f"Second step did not reach mobile-auth (HTTP {resp.status_code}).")
+            # No redirect: the page re-rendered, which for this flow means the code was
+            # rejected (or an unknown state). Surface a clear, actionable error.
+            raise SecondStepError(
+                "The SMS code was not accepted (no success redirect). Check the code and, "
+                "if it was correct, re-run with --trace so the flow can be inspected."
+            )
         raise SecondStepError("Too many redirects after submitting the code.")
 
-    def _tokens_from_redirect(self, url: httpx.URL) -> Tokens | None:
-        params = dict(url.params)
-        if "access_token" in params:
-            return Tokens(params["access_token"], params.get("refresh_token", ""))
-        return None
+    def _outcome(self, sentinel: httpx.URL) -> SecondStepOutcome:
+        path = sentinel.path
+        if path.endswith("/fail"):
+            raise SecondStepError("Wrong or expired SMS code.")
+        if path.endswith("/error"):
+            raise SecondStepError("Mail.ru reported an internal error on the second step.")
+        if not path.endswith("/success"):
+            raise SecondStepError(f"Unexpected second-step result path: {path!r}.")
+        tsa = self.client.cookies.get("tsa") or ""
+        if not tsa:
+            raise SecondStepError(
+                "Reached the success sentinel but no trusted-device (tsa) cookie was set; "
+                "re-run with --trace and inspect the cookies."
+            )
+        params = dict(sentinel.params)
+        if self.trace:
+            self.trace.note("secstep.success", params=list(params.keys()))
+        return SecondStepOutcome(tsa_cookie=tsa, additional_params=params, success_url=str(sentinel))
 
-    def _cookie(self, name: str) -> str:
-        return self.client.cookies.get(name, "") or ""
-
-    @staticmethod
-    def _find_form(page: httpx.Response) -> tuple[str | None, dict[str, str]]:
-        html = page.text
-        form = re.search(r"<form[^>]*>.*?</form>", html, re.I | re.S)
-        if not form:
-            return None, {}
-        block = form.group(0)
-        action = re.search(r'action\s*=\s*["\']([^"\']+)["\']', block, re.I)
-        fields: dict[str, str] = {}
-        for m in re.finditer(r"<input\b[^>]*>", block, re.I):
-            tag = m.group(0)
-            name = re.search(r'name\s*=\s*["\']([^"\']+)["\']', tag, re.I)
-            if not name:
-                continue
-            value = re.search(r'value\s*=\s*["\']([^"\']*)["\']', tag, re.I)
-            fields[name.group(1)] = value.group(1) if value else ""
-        return (action.group(1) if action else ""), fields
+    def _parse(self, resp: httpx.Response) -> SecstepPage:
+        html = resp.text
+        csrf = _field(html, "csrf") or ""
+        return SecstepPage(
+            response=resp,
+            csrf=csrf,
+            login=_field(html, "secstep_login") or "",
+            phone=_field(html, "secstep_phone") or "",
+            sms_send_url=_field(html, "force_sms_send_url") or DEFAULT_SMS_SEND_URL,
+            factor_choice_url=_field(html, "factor_choice_url") or "",
+            sms_enabled=_flag(html, "sms_enabled") is not False,
+        )
