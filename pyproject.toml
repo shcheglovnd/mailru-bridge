@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mailru-bridge"
+version = "0.0.1"
+description = "Standard IMAP/SMTP access to a Mail.ru (VK Почта) mailbox via the mobile app's private API"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "respx>=0.21"]
+
+[project.scripts]
+mailru-bridge = "mailru_bridge.cli:main"
+
+[tool.setuptools]
+packages = ["mailru_bridge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

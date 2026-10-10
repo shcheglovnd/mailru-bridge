@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Refuse commits that would publish private data.
+#
+# Enable once per checkout:   git config core.hooksPath .githooks
+#
+# Generic checks: real Mail.ru-family addresses, OAuth-looking tokens, phone numbers.
+# Personal checks: one extended regex per line in ~/.config/mailru-bridge/private-patterns
+# (your address, phone, name...). That file stays outside the repository.
+set -euo pipefail
+
+added=$(git diff --cached --unified=0 --no-color --diff-filter=ACM | grep -E '^\+' | grep -vE '^\+\+\+ ' || true)
+[ -z "$added" ] && exit 0
+
+fail=0
+report() {
+    echo "pre-commit: $1" >&2
+    printf '%s\n' "$2" | head -5 | sed 's/^/    /' >&2
+    fail=1
+}
+
+# Addresses on Mail.ru domains, except obvious placeholders.
+hits=$(printf '%s\n' "$added" \
+    | grep -oiE '[a-z0-9._%+-]+@(mail|inbox|list|bk|internet|vk)\.ru' \
+    | grep -viE '^(user|username|example|test|you|your|name|login|noreply|no-reply|support)@' || true)
+[ -n "$hits" ] && report "Mail.ru-family e-mail address in staged changes" "$hits"
+
+# Values that look like live credentials: a token field immediately followed by a long
+# high-entropy string. Requires a digit in the value and forbids '.', so Python attribute
+# access ("refresh_token = tokens.refresh_token") and prose do not trip it.
+hits=$(printf '%s\n' "$added" \
+    | grep -oiE '(access_token|refresh_token|password|tsa|mpop)["'"'"']?[=:] ?["'"'"']?[A-Za-z0-9_~+/-]{20,}' \
+    | grep -E '[0-9]' || true)
+[ -n "$hits" ] && report "token-like value in staged changes" "$hits"
+
+# Russian mobile numbers.
+hits=$(printf '%s\n' "$added" | grep -oE '(\+7|8)[ (-]*9[0-9]{2}[ )-]*[0-9]{3}[ -]*[0-9]{2}[ -]*[0-9]{2}' || true)
+[ -n "$hits" ] && report "phone number in staged changes" "$hits"
+
+patterns="${XDG_CONFIG_HOME:-$HOME/.config}/mailru-bridge/private-patterns"
+if [ -r "$patterns" ]; then
+    while IFS= read -r p || [ -n "$p" ]; do
+        [ -z "$p" ] && continue
+        case "$p" in \#*) continue ;; esac
+        hits=$(printf '%s\n' "$added" | grep -oiE -- "$p" || true)
+        [ -n "$hits" ] && report "matches a pattern from $patterns" "$hits"
+    done < "$patterns"
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo "pre-commit: commit refused. Remove the data above (or use --no-verify if it is a false positive)." >&2
+    exit 1
+fi

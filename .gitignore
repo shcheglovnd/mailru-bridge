@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+
+# Never commit runtime data: tokens, traces, mail. They live in ~/.local/state/mailru-bridge
+# by default; these patterns catch them if someone points the state dir into the checkout.
+state/
+trace/
+*.trace.jsonl
+account.json
+*.eml
+*.mbox
+Maildir/
+
+# Reverse-engineering artifacts (proprietary code, keep them out of the repo)
+*.apk
+*.xapk
+jadx-out/
