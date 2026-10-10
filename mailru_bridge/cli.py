@@ -24,6 +24,10 @@ def _login(args: argparse.Namespace) -> int:
     account = Account.load()
     if account is None or account.email != email:
         account = Account(email=email)
+    # Persist the device profile before the first login attempt. The server must see the
+    # SAME phone (DeviceID) on every retry — a fresh DeviceID each time looks like repeated
+    # logins from new devices and trips Mail.ru's anti-fraud (captcha). No secret is stored.
+    account.save()
 
     trace = Trace("login") if args.trace else None
     try:

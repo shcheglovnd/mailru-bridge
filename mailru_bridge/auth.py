@@ -113,6 +113,14 @@ class Authenticator:
                     "(trace the run and inspect it).",
                     status,
                 )
+            if "captcha" in cont.lower():
+                raise AuthError(
+                    "Mail.ru is demanding a captcha instead of the SMS step — its anti-fraud "
+                    "was tripped by repeated login attempts (a changing device made each one "
+                    "look like a new phone). Your device profile is now pinned; wait ~30–60 "
+                    "minutes without any login attempts, then try once more.",
+                    SwaStatus.CAPTCHA_REQUIRED,
+                )
             url = str(httpx.URL(cont).copy_merge_params({"client": "mobile.app"}))
             return SecondStepChallenge(url, body.get("LudwigToken", ""))
 
