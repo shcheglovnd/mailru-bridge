@@ -13,8 +13,11 @@
 - [x] Pin the SMS second-step exchange from the first traced login + the app decompile
       (`secstep` page JSON, `send_sms=1`, `AuthCode`/`csrf` POST, `mobile-auth/success`,
       trusted-`tsa` re-login). Implemented in `secondstep.py`; see `protocol.md`.
-- [ ] Confirm it end to end with one more live `--trace` login (redirect chain + token
-      response shape), then lock it in.
+- [x] Live-confirmed the SMS exchange (2026-10-11): code accepted, success redirect gives an
+      `AG_` token + trusted `tsa`. Finish with the **AG-token exchange** (not a password
+      re-auth, which hits a reCAPTCHA) → `Authenticator.exchange_ag_token`.
+- [ ] One more `--trace` login to confirm the AG-token exchange returns tokens end to end,
+      and whether a saved `tsa` lets later logins skip the SMS.
 - [ ] Probe and document the read endpoints: folder list, message list, single-message
       fetch (incl. raw/RFC822 source if available), flags, move.
 - [ ] API client: folders, list, fetch, flags, move, delete, send.

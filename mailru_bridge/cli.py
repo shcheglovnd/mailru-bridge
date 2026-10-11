@@ -46,15 +46,16 @@ def _login(args: argparse.Namespace) -> int:
                     outcome = flow.submit_code(page, email, code)
                     if outcome.tsa_cookie:
                         account.tsa_cookie = outcome.tsa_cookie
-                    # Re-run the password login as a now-trusted device: with the tsa cookie
-                    # the backend skips the second step and returns the OAuth tokens.
-                    client.cookies.clear()
-                    tokens = auth.start_password(email, password, account.tsa_cookie)
-                    if isinstance(tokens, SecondStepChallenge):
+                    ag_token = outcome.additional_params.get("token", "")
+                    if not ag_token:
                         raise AuthError(
-                            "Second step completed but the re-login still asks for a code; "
+                            "Second step succeeded but the success URL carried no AG token; "
                             "re-run with --trace and inspect it."
                         )
+                    # Trade the AG token for OAuth tokens (no password, no cookie) — this is
+                    # how the app finishes, and it avoids the captcha a password re-auth hits.
+                    client.cookies.clear()
+                    tokens = auth.exchange_ag_token(email, ag_token)
                     apply_tokens(account, tokens)
                 else:
                     apply_tokens(account, result)

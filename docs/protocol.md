@@ -75,21 +75,27 @@ as JSON: `csrf`, `secstep_login`, `secstep_phone` (masked), `force_sms_send_url`
 3. **Submit** `POST /cgi-bin/secstep` (plain form, `method=post`) with `csrf`, `Login`,
    `AuthCode=<code>`, `Permanent=1` ("trust this device"). Code field is `AuthCode` for SMS
    and TOTP, `calluiCode` for the call factor.
-4. The server redirects (caught, not fetched) to `https://mobile-auth/success` and sets a
-   now-**trusted** `tsa` cookie. `/fail` = wrong code, `/error` = server error
-   (`ru.mail.ui.webview.handler.MobileAuthUrlHandler`, `…feature.common.webview.CommonWebViewClient`).
-5. **Get tokens**: repeat the password `POST /cgi-bin/auth` carrying `Cookie: tsa=<value>`
-   (and the same `Login`/`Password`). The backend accepts the trusted device, skips the
-   second step and returns the OAuth tokens. This mirrors the app's
-   `CommonAuthorizationMailApi.getMailPasswordAuthorization(Login, Password, bind_token,
-   client_id, @Header Cookie, @FieldMap)` driven by `RequestMapper` →
-   `AuthRequestType.PasswordAuth(tsaCookie=…)`.
+4. The server redirects (caught, not fetched) to
+   `https://mobile-auth/success?token=AG_…&oauth2=1` and sets a now-**trusted** `tsa` cookie.
+   `/fail` = wrong code, `/error` = server error (`ru.mail.ui.webview.handler.MobileAuthUrlHandler`,
+   `…feature.common.webview.CommonWebViewClient`). That `token` is an **AuthGate (`AG_…`) token**,
+   not an access token.
+5. **Exchange the AG token for OAuth tokens**: `POST /cgi-bin/auth` with `Login`, `token=AG_…`,
+   `client_id=mail-android`, **no password and no cookie**, plus the base fields
+   `simple=1 mob_json=1 oauth2=1 migrant=0 migrant_native=0 ludwig=1`. Response is the usual
+   `{"body":{"access_token","refresh_token"}}`. This is the app's
+   `CommonAuthorizationMailApi.getMailAgTokenAuthorization(Login, token, client_id, @FieldMap)`
+   (base fields from `BaseOauthParams`, call site `CommonAuthorizationRepository.getMailTokensByAgToken`).
 
-The `tsa` cookie is long-lived (seen `expires` ≈ 90 days), so later logins send it on the
-first `/cgi-bin/auth` and skip the SMS entirely. Implemented in
-[`mailru_bridge/secondstep.py`](../mailru_bridge/secondstep.py); step 5 reuses
-`Authenticator.start_password`. **Pending one live `--trace` login to confirm the exact
-redirect chain and the token-response shape.**
+> **Do not** finish by re-sending the password (even with the trusted `tsa` cookie): that path
+> re-runs anti-fraud and is answered with an `808` whose `Continue` is a reCAPTCHA
+> (`account.mail.ru/login?mode=authcaptcha`). Confirmed live on 2026-10-11: the AG-token
+> exchange is the captcha-free completion.
+
+Steps 1–4 are confirmed from a live `--trace` run (SMS received, code accepted, `AG_` token +
+trusted `tsa` returned). The `tsa` cookie is long-lived (`expires` ≈ 90 days); whether sending
+it on a later first `/cgi-bin/auth` skips the SMS is still to be confirmed. Implemented in
+[`secondstep.py`](../mailru_bridge/secondstep.py) + `Authenticator.exchange_ag_token`.
 
 ### Refresh
 `POST https://o2.mail.ru/token`, form `client_id=mail-android`, `grant_type=refresh_token`,

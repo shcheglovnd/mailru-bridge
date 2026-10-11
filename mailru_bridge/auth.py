@@ -132,6 +132,40 @@ class Authenticator:
             raise AuthError("Too many login attempts; wait before retrying.", status)
         raise AuthError(f"Login failed (SWA status {status}).", status)
 
+    def exchange_ag_token(self, email: str, ag_token: str) -> Tokens:
+        """Finish a 2FA login by trading the second step's AG token for OAuth tokens.
+
+        The SMS step ends at ``https://mobile-auth/success?token=AG_…``; that ``token`` is an
+        "AuthGate" token, not an access token. The app exchanges it with a dedicated call —
+        ``POST /cgi-bin/auth`` carrying ``token`` instead of ``Password`` and **no cookie**
+        (``CommonAuthorizationMailApi.getMailAgTokenAuthorization``; base fields from
+        ``BaseOauthParams``). Re-sending the password here instead would re-run anti-fraud and
+        can be answered with a captcha, which is what happened before this path existed.
+        """
+        url = httpx.URL(
+            f"https://{AUTH_HOST}/cgi-bin/auth",
+            params=signed_query(_base_query(self.device, email)),
+        )
+        form = {
+            "Login": email,
+            "token": ag_token,
+            "client_id": CLIENT_ID,
+            "simple": "1",
+            "mob_json": "1",
+            "oauth2": "1",
+            "migrant": "0",
+            "migrant_native": "0",
+            "ludwig": "1",
+        }
+        headers = {"User-Agent": USER_AGENT, "X-Mobile-App": X_MOBILE_APP}
+        resp = self.client.post(url, data=form, headers=headers)
+        result = self._read_password_response(resp)
+        if isinstance(result, SecondStepChallenge):
+            raise AuthError(
+                "AG-token exchange unexpectedly asked for another step; inspect the trace."
+            )
+        return result
+
     # -- token refresh -----------------------------------------------------
 
     def refresh(self, refresh_token: str) -> Tokens:
