@@ -45,7 +45,11 @@ def _login(args: argparse.Namespace) -> int:
                     code = input("SMS code: ").strip()
                     outcome = flow.submit_code(page, email, code)
                     if outcome.tsa_cookie:
+                        # Persist the trusted-device cookie the moment we earn it, before the
+                        # token exchange can fail — it is what lets later logins skip the SMS,
+                        # and a fresh SMS is expensive (anti-fraud, captcha).
                         account.tsa_cookie = outcome.tsa_cookie
+                        account.save()
                     ag_token = outcome.additional_params.get("token", "")
                     if not ag_token:
                         raise AuthError(
