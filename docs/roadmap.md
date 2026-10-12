@@ -21,8 +21,10 @@
 - [x] Confirmed (2026-10-11): a saved trusted `tsa` cookie skips the SMS entirely — the
       next login is a single `POST /cgi-bin/auth` (password + `tsa`) → tokens, no second
       step and no captcha. Auth is complete end to end.
-- [ ] Probe and document the read endpoints: folder list, message list, single-message
-      fetch (incl. raw/RFC822 source if available), flags, move.
+- [x] Folder list: `GET /api/v1/folders` (signed query + `access_token`) — confirmed live,
+      schema documented in `protocol.md`.
+- [ ] Probe and document the rest of the read path: message/thread list per folder, single-message
+      fetch (incl. raw/RFC822 source if available), flags, move. Needs body `md5_post_signature`.
 - [ ] API client: folders, list, fetch, flags, move, delete, send.
 
 ### Then

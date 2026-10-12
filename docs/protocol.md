@@ -125,5 +125,21 @@ Endpoints confirmed from `@UrlPath` / Retrofit annotations:
 | `api/v1/filters` | filters |
 | `api/v1/messages/attaches/get` | fetch an attachment |
 
-Single-message read, flag/move and folder-list endpoints are obfuscated in the APK and are
-to be confirmed by live probing (see [roadmap.md](roadmap.md)).
+### Folder list — confirmed live (2026-10-11)
+
+`GET https://aj-https.mail.ru/api/v1/folders` with the standard platform params + `email` +
+`lang` + `access_token`, all `md5_signature`-signed in the query (no body, no post-signature).
+Returns `{"status":200,"htmlencoded":true,"email":…,"last_modified":<unix>,"body":[ folder… ]}`.
+
+Each folder object carries:
+`id` (string; system folders use fixed ids, custom folders small integers), `name`, `parent`,
+`child`, `children`, `type`, `system`, `open`, `favorite`, `archive`, `security`, `share`,
+`only_web`, `new_cnt`, `last_visit`, `size`, `cloud_stock_size`, and the counters
+`messages_total`, `messages_unread`, `messages_flagged`, `messages_pinned`, `messages_snoozed`,
+`messages_with_attachments`.
+
+Fixed system-folder ids (same for every account): `0` Inbox, `500000` Sent, `500001` Drafts,
+`500002` Trash, `500010` Archive, `500011` Social, `950` Spam.
+
+Single-message read and flag/move endpoints are obfuscated in the APK and are still to be
+confirmed by live probing (see [roadmap.md](roadmap.md)).
