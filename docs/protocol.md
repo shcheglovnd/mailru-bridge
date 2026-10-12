@@ -82,8 +82,10 @@ as JSON: `csrf`, `secstep_login`, `secstep_phone` (masked), `force_sms_send_url`
    not an access token.
 5. **Exchange the AG token for OAuth tokens**: `POST /cgi-bin/auth` with `Login`, `token=AG_…`,
    `client_id=mail-android`, **no password and no cookie**, plus the base fields
-   `simple=1 mob_json=1 oauth2=1 migrant=0 migrant_native=0 ludwig=1`. Response is the usual
-   `{"body":{"access_token","refresh_token"}}`. This is the app's
+   `simple=1 mob_json=1 oauth2=1 migrant=0 migrant_native=0 ludwig=1`. Response carries **no
+   `X-SWA-STATUS` header** and wraps the tokens in `oauth` (not `body`):
+   `{"status":"ok","oauth":{"access_token","refresh_token","expires_in":86400}}`
+   (confirmed live 2026-10-11). This is the app's
    `CommonAuthorizationMailApi.getMailAgTokenAuthorization(Login, token, client_id, @FieldMap)`
    (base fields from `BaseOauthParams`, call site `CommonAuthorizationRepository.getMailTokensByAgToken`).
 
@@ -92,9 +94,10 @@ as JSON: `csrf`, `secstep_login`, `secstep_phone` (masked), `force_sms_send_url`
 > (`account.mail.ru/login?mode=authcaptcha`). Confirmed live on 2026-10-11: the AG-token
 > exchange is the captcha-free completion.
 
-Steps 1–4 are confirmed from a live `--trace` run (SMS received, code accepted, `AG_` token +
-trusted `tsa` returned). The `tsa` cookie is long-lived (`expires` ≈ 90 days); whether sending
-it on a later first `/cgi-bin/auth` skips the SMS is still to be confirmed. Implemented in
+Steps 1–5 are confirmed end to end from a live `--trace` run (SMS received, code accepted,
+`AG_` token + trusted `tsa` returned, AG exchange returned a real access + refresh token). The
+`tsa` cookie is long-lived (`expires` ≈ 90 days); whether sending it on a later first
+`/cgi-bin/auth` skips the SMS is still to be confirmed. Implemented in
 [`secondstep.py`](../mailru_bridge/secondstep.py) + `Authenticator.exchange_ag_token`.
 
 ### Refresh
