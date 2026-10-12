@@ -38,7 +38,10 @@
 - [x] SMTP front end (`smtp_server.py`) → `messages/send`; recipient routing incl. Bcc; attachments.
       Verified with `smtplib`.
 - [x] Service runner (`service.py`) + `setup`/`serve` CLI; gentle background poll; `429` backoff.
-- [ ] **Live send test** (one self-addressed message) to confirm `messages/send` field names.
+- [x] **Live send confirmed** (2026-10-12): a self-addressed message sent via `messages/send`
+      (returns `{"id":…}`), arrived in Inbox in ~5s, and the server filed the Sent copy itself.
+      `send`/`draft` require a client-generated 32-char `id`; delete is permanent only from
+      Trash/Spam, else move to Trash.
 - [ ] Draft APPEND via `messages/draft` (currently sends; draft endpoint wiring is a follow-up).
 - [ ] Run under systemd; reach it over WireGuard; TLS cert from the home CA.
 - [ ] Richer SEARCH (header/body/date predicates) — currently ALL/SEEN/FLAGGED.
