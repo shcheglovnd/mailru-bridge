@@ -56,7 +56,7 @@ class Syncer:
         for f in await self.api.folders():
             self.cache.upsert_folder(f.id, f.name, f.parent, f.type, f.system, f.total, f.unread)
 
-    async def initial_sync(self, fid: str, depth: int = 2000, page: int = 100) -> int:
+    async def initial_sync(self, fid: str, depth: int = 2000, page: int = 200) -> int:
         """Load up to ``depth`` newest messages of a folder. Returns how many are now cached."""
         collected: list[RemoteMessage] = []
         offset = 0
@@ -69,16 +69,18 @@ class Syncer:
             offset += len(result.messages)
             if offset >= result.total:
                 break
-        # insert oldest-first so UID order matches arrival order for the first batch
-        for m in reversed(collected):
-            self.cache.add_message(fid, m.id, m.date, m.size, imap_flags(m), _meta(m))
+        # insert oldest-first (one transaction) so UID order matches arrival order
+        self.cache.add_messages_batch(
+            fid,
+            [(m.id, m.date, m.size, imap_flags(m), _meta(m)) for m in reversed(collected)],
+        )
         import time as _t
 
         self.cache.set_last_sync(fid, _t.time())
         log.info("initial sync %s: %d messages", fid, len(collected))
         return len(collected)
 
-    async def incremental_sync(self, fid: str, window: int = 200, page: int = 100) -> tuple[int, list[int]]:
+    async def incremental_sync(self, fid: str, window: int = 200, page: int = 200) -> tuple[int, list[int]]:
         """Refresh the newest ``window`` messages. Returns (new_count, expunged_uids).
 
         New messages are added with fresh UIDs; flags are refreshed; any cached message that falls
@@ -99,14 +101,13 @@ class Syncer:
             if offset >= result.total:
                 break
 
-        new_count = 0
         remote_ids = {m.id for m in seen_remote}
-        # Add/refresh, oldest-first among the brand-new ones for tidy UID order.
+        # Add new, oldest-first (one transaction) for tidy UID order; refresh flags on the rest.
         known = self.cache.live_mailru_ids(fid)
         fresh = [m for m in seen_remote if m.id not in known]
-        for m in reversed(fresh):
-            self.cache.add_message(fid, m.id, m.date, m.size, imap_flags(m), _meta(m))
-            new_count += 1
+        new_count = self.cache.add_messages_batch(
+            fid, [(m.id, m.date, m.size, imap_flags(m), _meta(m)) for m in reversed(fresh)]
+        )
         for m in seen_remote:
             if m.id in known:
                 uid = self.cache.uid_for(fid, m.id)

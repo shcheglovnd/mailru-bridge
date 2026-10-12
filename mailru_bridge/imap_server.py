@@ -528,12 +528,36 @@ class ImapConnection:
         ranges = parse_sequence_set(seqset, self.snapshot, len(self.snapshot))
         targets = self._resolve(ranges, by_uid)
         items = _parse_fetch_items(items_spec)
+        # If any item needs the raw message, download all of them concurrently (bounded) before
+        # formatting — otherwise a multi-message FETCH would fetch bodies one-at-a-time and crawl.
+        if targets and any(_needs_raw(it) for it in items):
+            await self._prefetch_raw([uid for _, uid in targets])
         for seq, uid in targets:
             resp = await self._fetch_one(seq, uid, items, by_uid)
             if resp is not None:
                 await self.untagged(resp)
         await self.tagged(tag, "OK", ("UID " if by_uid else "") + "FETCH completed")
         return True
+
+    async def _prefetch_raw(self, uids: list[int], concurrency: int = 10) -> None:
+        """Warm the raw-source cache for many messages at once, bounded by a semaphore.
+
+        The shared rate limiter still spaces request starts; this just lets the ~1.5s downloads
+        overlap instead of running strictly in series.
+        """
+        need = [u for u in uids if self.s.cache.get_raw(self.selected, u) is None]
+        if not need:
+            return
+        sem = asyncio.Semaphore(concurrency)
+
+        async def one(u: int) -> None:
+            async with sem:
+                try:
+                    await self.s.syncer.ensure_raw(self.selected, u)
+                except Exception:  # noqa: BLE001 — a single bad message must not fail the batch
+                    log.debug("prefetch raw failed for uid %s", u, exc_info=True)
+
+        await asyncio.gather(*(one(u) for u in need))
 
     async def _fetch_one(self, seq: int, uid: int, items: list[str], by_uid: bool) -> bytes | None:
         cm = self.s.cache.message_by_uid(self.selected, uid)

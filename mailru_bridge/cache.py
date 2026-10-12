@@ -169,6 +169,36 @@ class Cache:
             self._conn.commit()
             return uid
 
+    def add_messages_batch(self, fid: str, items: list[tuple]) -> int:
+        """Insert many new messages in one transaction, assigning sequential UIDs.
+
+        ``items`` is ``[(mailru_id, date, size, flags:set, meta:dict), ...]`` in the order to assign
+        UIDs (oldest first). Messages already present (by mailru_id) are skipped. Returns how many
+        were inserted. Much faster than per-message :meth:`add_message` for an initial sync.
+        """
+        with self._lock:
+            row = self._conn.execute("SELECT uidnext FROM folders WHERE id=?", (fid,)).fetchone()
+            uid = row["uidnext"] if row else 1
+            existing = self.live_mailru_ids(fid)
+            also = {r["mailru_id"] for r in self._conn.execute(
+                "SELECT mailru_id FROM messages WHERE folder_id=?", (fid,)).fetchall()}
+            existing |= also
+            rows = []
+            for mailru_id, date, size, flags, meta in items:
+                if mailru_id in existing:
+                    continue
+                existing.add(mailru_id)
+                rows.append((fid, uid, mailru_id, date, size, _flags_to_text(flags),
+                             json.dumps(meta, ensure_ascii=False)))
+                uid += 1
+            if rows:
+                self._conn.executemany(
+                    "INSERT INTO messages(folder_id,uid,mailru_id,date,size,flags,meta) "
+                    "VALUES(?,?,?,?,?,?,?)", rows)
+                self._conn.execute("UPDATE folders SET uidnext=? WHERE id=?", (uid, fid))
+                self._conn.commit()
+            return len(rows)
+
     def update_flags(self, fid: str, uid: int, flags: set[str]) -> None:
         with self._lock:
             self._conn.execute(

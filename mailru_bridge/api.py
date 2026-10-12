@@ -187,7 +187,7 @@ class RateLimiter:
     ``penalize`` stretches the spacing after a 429 or a server error and decays back slowly.
     """
 
-    def __init__(self, interval: float = 0.6, jitter: float = 0.4):
+    def __init__(self, interval: float = 0.15, jitter: float = 0.1):
         self.interval = interval
         self.jitter = jitter
         self._next = 0.0
