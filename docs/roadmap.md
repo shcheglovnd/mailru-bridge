@@ -18,7 +18,9 @@
       re-auth, which hits a reCAPTCHA) → `Authenticator.exchange_ag_token`.
 - [x] Confirmed live (2026-10-11) the AG-token exchange returns real tokens — they arrive in an
       `oauth` wrapper with no `X-SWA-STATUS` header (`_token_container` handles all shapes).
-- [ ] Confirm whether the saved trusted `tsa` lets a later login skip the SMS.
+- [x] Confirmed (2026-10-11): a saved trusted `tsa` cookie skips the SMS entirely — the
+      next login is a single `POST /cgi-bin/auth` (password + `tsa`) → tokens, no second
+      step and no captcha. Auth is complete end to end.
 - [ ] Probe and document the read endpoints: folder list, message list, single-message
       fetch (incl. raw/RFC822 source if available), flags, move.
 - [ ] API client: folders, list, fetch, flags, move, delete, send.

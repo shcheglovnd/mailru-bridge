@@ -96,8 +96,10 @@ as JSON: `csrf`, `secstep_login`, `secstep_phone` (masked), `force_sms_send_url`
 
 Steps 1–5 are confirmed end to end from a live `--trace` run (SMS received, code accepted,
 `AG_` token + trusted `tsa` returned, AG exchange returned a real access + refresh token). The
-`tsa` cookie is long-lived (`expires` ≈ 90 days); whether sending it on a later first
-`/cgi-bin/auth` skips the SMS is still to be confirmed. Implemented in
+`tsa` cookie is long-lived (`expires` ≈ 90 days) and, **confirmed live 2026-10-11, skips the
+second step entirely**: the next login is a single `POST /cgi-bin/auth` carrying `Password`
+plus the `tsa` cookie, answered straight away with `{"status":"ok","oauth":{…}}` — no secstep,
+no SMS, no captcha. Implemented in
 [`secondstep.py`](../mailru_bridge/secondstep.py) + `Authenticator.exchange_ag_token`.
 
 ### Refresh
