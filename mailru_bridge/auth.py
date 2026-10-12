@@ -61,6 +61,7 @@ class SecondStepChallenge:
 class Tokens:
     access_token: str
     refresh_token: str
+    expires_in: int | None = None
 
 
 def _base_query(device: Device, email: str) -> list[tuple[str, str]]:
@@ -180,12 +181,17 @@ class Authenticator:
         }
         resp = self.client.post(url, data=form, headers={"User-Agent": USER_AGENT})
         body = self._json(resp)
-        if resp.status_code != 200 or "access_token" not in body:
+        container = self._token_container(body)
+        if resp.status_code != 200 or container is None:
             raise AuthError(
                 f"Token refresh failed (HTTP {resp.status_code}); re-run login.",
                 resp.status_code,
             )
-        return Tokens(body["access_token"], body.get("refresh_token", refresh_token))
+        return Tokens(
+            container["access_token"],
+            container.get("refresh_token", refresh_token),
+            container.get("expires_in"),
+        )
 
     # -- helpers -----------------------------------------------------------
 
@@ -208,21 +214,41 @@ class Authenticator:
         return data if isinstance(data, dict) else {}
 
     @staticmethod
+    def _token_container(body: dict) -> dict | None:
+        """Find the dict that holds the tokens across the backend's response shapes.
+
+        A direct password login answers ``{"body": {access_token, …}}``; the AG-token
+        exchange answers ``{"status": "ok", "oauth": {access_token, refresh_token,
+        expires_in}}``; the refresh endpoint answers flat. Check each in turn.
+        """
+        for key in ("oauth", "body"):
+            inner = body.get(key)
+            if isinstance(inner, dict) and "access_token" in inner:
+                return inner
+        if "access_token" in body:
+            return body
+        return None
+
+    @staticmethod
     def _has_tokens(body: dict) -> bool:
-        inner = body.get("body", body)
-        return isinstance(inner, dict) and "access_token" in inner
+        return Authenticator._token_container(body) is not None
 
     @staticmethod
     def _tokens(body: dict) -> Tokens:
-        inner = body.get("body", body)
-        return Tokens(inner["access_token"], inner.get("refresh_token", ""))
+        inner = Authenticator._token_container(body) or {}
+        return Tokens(
+            inner["access_token"],
+            inner.get("refresh_token", ""),
+            inner.get("expires_in"),
+        )
 
 
 def apply_tokens(account: Account, tokens: Tokens) -> None:
     account.access_token = tokens.access_token
     if tokens.refresh_token:
         account.refresh_token = tokens.refresh_token
-    account.access_expires_at = time.time() + ACCESS_TTL
+    ttl = tokens.expires_in if tokens.expires_in else ACCESS_TTL
+    account.access_expires_at = time.time() + ttl
 
 
 def ensure_access_token(client: httpx.Client, account: Account) -> str:
