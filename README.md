@@ -8,9 +8,10 @@ the web interface and the official mobile app stay free. This bridge talks to th
 private JSON API the Android app uses and re-exposes the mailbox over plain IMAP and SMTP
 on your own machine, so existing clients keep working.
 
-> **Status: early.** The login (password + SMS) and token refresh are implemented; the
-> IMAP and SMTP front ends are in progress. See [docs/protocol.md](docs/protocol.md) for
-> the reverse-engineered API and [docs/roadmap.md](docs/roadmap.md) for what works.
+> **Status: working.** Login (password + SMS, then token refresh), a local IMAP server (folders,
+> message list, raw-source fetch, flags, move, delete, search, IDLE) and an SMTP submission server
+> are implemented and tested against a live account. See [docs/protocol.md](docs/protocol.md) for
+> the reverse-engineered API and [docs/roadmap.md](docs/roadmap.md) for what remains.
 
 ## How it works
 
@@ -46,6 +47,38 @@ mailru-bridge status
   generated device profile are saved, under `~/.local/state/mailru-bridge/` (mode 0600).
 - A successful SMS step also stores a *trusted-device* cookie, so later logins can skip the
   SMS.
+
+## Run the bridge
+
+Set the password your mail clients will use with the bridge (this is **not** your Mail.ru
+password, which the bridge never stores), then start the servers:
+
+```sh
+mailru-bridge setup          # prompts for a client password; sets ports (IMAP 1143, SMTP 1025)
+mailru-bridge serve          # runs the IMAP + SMTP servers and a gentle background sync
+```
+
+`setup` options: `--bind` (default `127.0.0.1`), `--imap-port`, `--smtp-port`, `--tls-cert` /
+`--tls-key` (PEM, for implicit TLS), `--poll` (background sync seconds), `--username`.
+
+### Point a mail client at it
+
+Use your Mail.ru address as the username and the **bridge** password you just set:
+
+| | Server | Port | Security |
+|---|---|---|---|
+| IMAP | your bridge host | 1143 | STARTTLS/SSL if you set a cert, else none (VPN only) |
+| SMTP | your bridge host | 1025 | same |
+
+Let the **server manage Sent and Drafts** (the API files sent mail in Sent itself). The first time
+a large folder is opened the bridge syncs its newest messages (configurable depth) into a local
+cache; later opens are served from the cache and only new mail is fetched.
+
+What works: folder list, message list, reading (headers shown without downloading the whole
+message; the full source is fetched once when you open a message and then cached), mark read/unread
+and flagged, move, delete (to Trash), create/rename/delete folders, IDLE, and sending with
+attachments. `COPY` is not supported (Mail.ru has no copy — use move); arbitrary `APPEND` is limited
+(Sent/Drafts are server-managed).
 
 ## Privacy & safety
 

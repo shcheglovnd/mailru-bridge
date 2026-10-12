@@ -23,17 +23,28 @@
       step and no captcha. Auth is complete end to end.
 - [x] Folder list: `GET /api/v1/folders` (signed query + `access_token`) — confirmed live,
       schema documented in `protocol.md`.
-- [ ] Probe and document the rest of the read path: message/thread list per folder, single-message
-      fetch (incl. raw/RFC822 source if available), flags, move. Needs body `md5_post_signature`.
-- [ ] API client: folders, list, fetch, flags, move, delete, send.
+- [x] Read path confirmed live (2026-10-11): per-folder list `messages/status`, and the **raw
+      RFC822 source** via `messages/message/download` (`message/rfc822`). Flags/move/remove/folders
+      and send pinned from the decompile. Documented in `protocol.md`.
+- [x] API client (`api.py`): folders, list, raw fetch, marks, move, remove, folder CRUD, attach
+      upload, send — async, one shared rate limiter, auto token refresh on `403 user`.
 
 ### Then
-- [ ] IMAP front end backed by a local cache, syncing from the API.
-- [ ] SMTP front end mapping submission to `messages/send`.
-- [ ] Run as a service; gentle poll interval; backoff on `429`/captcha.
-- [ ] Packaging and setup docs for Thunderbird / FairEmail.
+- [x] Local cache (`cache.py`, SQLite): stable IMAP UID ↔ Mail.ru id, flags, cached raw source.
+- [x] Sync engine (`sync.py`): initial (bounded) + incremental, flag mapping, deletion detection.
+- [x] Byte-exact MIME (`mime.py`) + IMAP `ENVELOPE`/`BODYSTRUCTURE` (`imap_struct.py`).
+- [x] IMAP front end (`imap_server.py`): LOGIN/LIST/STATUS/SELECT/FETCH/STORE/SEARCH/MOVE/EXPUNGE/
+      APPEND/IDLE, UID variants, modified UTF-7 names. Verified with `imaplib` against the live box.
+- [x] SMTP front end (`smtp_server.py`) → `messages/send`; recipient routing incl. Bcc; attachments.
+      Verified with `smtplib`.
+- [x] Service runner (`service.py`) + `setup`/`serve` CLI; gentle background poll; `429` backoff.
+- [ ] **Live send test** (one self-addressed message) to confirm `messages/send` field names.
+- [ ] Draft APPEND via `messages/draft` (currently sends; draft endpoint wiring is a follow-up).
+- [ ] Run under systemd; reach it over WireGuard; TLS cert from the home CA.
+- [ ] Richer SEARCH (header/body/date predicates) — currently ALL/SEEN/FLAGGED.
+- [ ] Packaging and client setup docs for Thunderbird / FairEmail.
 
-### Open questions
-- Is there a raw RFC822 source endpoint, or must messages be rebuilt from JSON + parts?
-- Exact push/long-poll for new mail, to avoid tight polling.
-- How aggressive is anti-fraud for a non-official client — keep traffic app-like.
+### Resolved questions
+- Raw RFC822 source exists (`messages/message/download`) — no need to rebuild from JSON.
+- Polling: incremental `messages/status` over a newest-first window; IDLE is poll-backed for now.
+- Anti-fraud: keep one pinned device and a single rate-limited request stream (see `api.RateLimiter`).

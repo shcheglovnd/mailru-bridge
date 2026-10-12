@@ -141,5 +141,48 @@ Each folder object carries:
 Fixed system-folder ids (same for every account): `0` Inbox, `500000` Sent, `500001` Drafts,
 `500002` Trash, `500010` Archive, `500011` Social, `950` Spam.
 
-Single-message read and flag/move endpoints are obfuscated in the APK and are still to be
-confirmed by live probing (see [roadmap.md](roadmap.md)).
+### Message list — confirmed live (2026-10-11)
+
+`GET api/v1/messages/status` with `folder`, `offset`, `limit`, `sort` (the app sends
+`{"type":"id","order":"desc"}`), `snippet_limit`, `last_modified` (0 on the first page). Returns
+`{"status":200,"body":{"messages":[…],"messages_total":N,"folders":[…],"last_modified":…}}`.
+Each message object: `id` (decimal string, time-ordered), `folder`, `date` (unix seconds),
+`size`, `subject`, `snippet`, `priority`, `m_thread_id`, `correspondents`
+(`from`/`to`/`cc`/`bcc`, each `{name,email,avatars}`), and a `flags` object
+(`unread`, `flagged`, `pinned`, `reply`, `forward`, `attach`, `newsletter`, …). The app's richer
+`api/v1/m/threads/status/smart` groups messages into threads; the flat `messages/status` is simpler
+and sufficient for a per-folder listing.
+
+Flag mapping to IMAP: `unread=false` → `\Seen`; `flagged` → `\Flagged`; `reply` → `\Answered`;
+`forward` → the `$Forwarded` keyword.
+
+### Single message, raw RFC 822 — confirmed live (2026-10-11)
+
+`POST api/v1/messages/message/download`, body `id` + `folder_id` (signed with
+`md5_post_signature`). Responds with `Content-Type: message/rfc822` (or `application/octet-stream`)
+and the **original message source** — full headers (DKIM, Received, Authentication-Results…) and all
+MIME parts, CRLF line endings. This is the raw source IMAP needs; messages do not have to be rebuilt
+from JSON. (The JSON `api/v1/messages/message` endpoint returns parsed body + metadata and is not
+needed once the raw source is available.)
+
+### Flags / move / delete — from the decompile (`ru.mail.data.cmd.server`)
+
+- **Marks** `POST api/v1/messages/marks`, body `marks` = JSON array of
+  `{"name":"unread|flagged|pinned","set":[ids],"unset":[ids],"folder":<id>}`
+  (`MarkCommandBaseParams`). Set/unset `unread` for `\Seen`, `flagged` for `\Flagged`.
+- **Move** `POST api/v1/messages/move`, body `ids` = JSON array of message ids + `folder` = dest id
+  (`TornadoMoveMessage`). **Delete** = move to Trash via `POST api/v1/messages/remove`, body
+  `ids` (`TornadoRemoveMessage`). Mail.ru has no copy endpoint, so IMAP `COPY` is unsupported;
+  `MOVE` is.
+- **Folders** `POST api/v1/folders/{add,edit,remove}`, body `email` + `folders`/`ids` as JSON
+  (`CreateFolder`/`UpdateFolder`/`DeleteFolder`).
+
+### Send — from the decompile (`TornadoSendRequest`/`TornadoSendParamsImpl`)
+
+Upload each attachment with `POST api/v1/messages/attaches/add` (multipart `file`, **no**
+`md5_post_signature`) → `{"body":{"attach":{"id":…}}}`. Then `POST api/v1/messages/send` with
+form fields `correspondents` (`{"to","cc","bcc"}`), `body` (`{"html","text"}`), `attaches`
+(`{"list":[{"id","type":"attach"}|{"content_id","type":"inline","part_id"}]}`), `from`, `subject`,
+`priority` (1/3/5), `receipt`, `send_date`, and optional `source` (`{"reply"|"forward"|"draft"|
+"schedule": <id>}`). Mail.ru files the sent copy in Sent itself. All `TORNADO_MPOP` commands carry
+the `access_token` in the signed query.

@@ -96,6 +96,69 @@ def _status(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _setup(args: argparse.Namespace) -> int:
+    """Configure how the local IMAP/SMTP servers listen and the password clients use."""
+    from .config import BridgeConfig, hash_password
+
+    account = Account.load()
+    if account is None:
+        print("Log in first: `mailru-bridge login`.", file=sys.stderr)
+        return 1
+    cfg = BridgeConfig.load() or BridgeConfig()
+    cfg.username = args.username or cfg.username or account.email
+    if args.imap_port:
+        cfg.imap_port = args.imap_port
+    if args.smtp_port:
+        cfg.smtp_port = args.smtp_port
+    if args.bind:
+        cfg.bind_host = args.bind
+    if args.tls_cert:
+        cfg.tls_cert = args.tls_cert
+    if args.tls_key:
+        cfg.tls_key = args.tls_key
+    if args.poll:
+        cfg.poll_seconds = args.poll
+    if not cfg.password_hash or args.password:
+        pw = getpass.getpass("Password for mail clients to use with the bridge: ")
+        again = getpass.getpass("Repeat: ")
+        if pw != again:
+            print("Passwords do not match.", file=sys.stderr)
+            return 1
+        cfg.password_hash = hash_password(pw)
+    cfg.save()
+    print(f"Bridge configured. Clients log in as {cfg.username!r}.")
+    print(f"  IMAP: {cfg.bind_host}:{cfg.imap_port}   SMTP: {cfg.bind_host}:{cfg.smtp_port}   TLS: {cfg.tls}")
+    print("Start it with `mailru-bridge serve`.")
+    return 0
+
+
+def _serve(args: argparse.Namespace) -> int:
+    import asyncio
+    import logging
+
+    from .config import BridgeConfig
+    from .service import BridgeService
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    account = Account.load()
+    if account is None:
+        print("Log in first: `mailru-bridge login`.", file=sys.stderr)
+        return 1
+    cfg = BridgeConfig.load()
+    if cfg is None or not cfg.password_hash:
+        print("Run `mailru-bridge setup` first to set the bridge password.", file=sys.stderr)
+        return 1
+    service = BridgeService(account, cfg)
+    try:
+        asyncio.run(service.run())
+    except KeyboardInterrupt:
+        print("Stopped.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="mailru-bridge")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -108,6 +171,21 @@ def main(argv: list[str] | None = None) -> int:
 
     p_status = sub.add_parser("status", help="show the stored session")
     p_status.set_defaults(func=_status)
+
+    p_setup = sub.add_parser("setup", help="configure the IMAP/SMTP servers and client password")
+    p_setup.add_argument("--username", help="what mail clients log in as (default: your address)")
+    p_setup.add_argument("--password", action="store_true", help="(re)set the client password")
+    p_setup.add_argument("--bind", help="address to listen on (default 127.0.0.1)")
+    p_setup.add_argument("--imap-port", type=int, help="IMAP port (default 1143)")
+    p_setup.add_argument("--smtp-port", type=int, help="SMTP port (default 1025)")
+    p_setup.add_argument("--tls-cert", help="PEM certificate for implicit TLS")
+    p_setup.add_argument("--tls-key", help="PEM private key for implicit TLS")
+    p_setup.add_argument("--poll", type=int, help="background poll interval, seconds")
+    p_setup.set_defaults(func=_setup)
+
+    p_serve = sub.add_parser("serve", help="run the IMAP/SMTP bridge")
+    p_serve.add_argument("-v", "--verbose", action="store_true", help="debug logging")
+    p_serve.set_defaults(func=_serve)
 
     args = parser.parse_args(argv)
     return args.func(args)
