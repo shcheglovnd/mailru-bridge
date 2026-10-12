@@ -249,13 +249,22 @@ class ImapConnection:
         rest = head[2] if len(head) > 2 else b""
         rest_tokens: list[tuple[str, bytes]] = [("t", rest)] + tokens[1:]
 
-        if command == "UID":
-            return await self.cmd_uid(tag, rest, rest_tokens)
-        handler = getattr(self, f"cmd_{command.lower().replace('.', '_')}", None)
-        if handler is None:
-            await self.tagged(tag, "BAD", f"unknown command {command}")
-            return True
-        return await handler(tag, rest, rest_tokens)
+        import time as _t
+
+        t0 = _t.monotonic()
+        preview = rest[:80].decode("latin-1", "replace")
+        try:
+            if command == "UID":
+                return await self.cmd_uid(tag, rest, rest_tokens)
+            handler = getattr(self, f"cmd_{command.lower().replace('.', '_')}", None)
+            if handler is None:
+                await self.tagged(tag, "BAD", f"unknown command {command}")
+                return True
+            return await handler(tag, rest, rest_tokens)
+        finally:
+            dt = _t.monotonic() - t0
+            if dt > 0.5:
+                log.info("IMAP %s %s -> %.1fs", command, preview, dt)
 
     # -- basic -----------------------------------------------------------------------------
 
@@ -548,6 +557,7 @@ class ImapConnection:
         need = [u for u in uids if self.s.cache.get_raw(self.selected, u) is None]
         if not need:
             return
+        log.info("prefetch: %d/%d bodies need download (folder %s)", len(need), len(uids), self.selected)
         sem = asyncio.Semaphore(concurrency)
 
         async def one(u: int) -> None:
