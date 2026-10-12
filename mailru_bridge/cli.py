@@ -118,6 +118,10 @@ def _setup(args: argparse.Namespace) -> int:
         cfg.tls_key = args.tls_key
     if args.poll:
         cfg.poll_seconds = args.poll
+    if args.initial_depth:
+        cfg.initial_depth = args.initial_depth
+    if args.sync_window:
+        cfg.sync_window = args.sync_window
     if not cfg.password_hash or args.password:
         pw = getpass.getpass("Password for mail clients to use with the bridge: ")
         again = getpass.getpass("Repeat: ")
@@ -143,6 +147,10 @@ def _serve(args: argparse.Namespace) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # httpx logs the full request URL at INFO, which includes the access_token and DeviceID in the
+    # query. Keep those out of the journal: only warnings and errors from the HTTP layer.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     account = Account.load()
     if account is None:
         print("Log in first: `mailru-bridge login`.", file=sys.stderr)
@@ -181,6 +189,10 @@ def main(argv: list[str] | None = None) -> int:
     p_setup.add_argument("--tls-cert", help="PEM certificate for implicit TLS")
     p_setup.add_argument("--tls-key", help="PEM private key for implicit TLS")
     p_setup.add_argument("--poll", type=int, help="background poll interval, seconds")
+    p_setup.add_argument("--initial-depth", type=int,
+                         help="newest messages to sync per folder on first open (default 2000)")
+    p_setup.add_argument("--sync-window", type=int,
+                         help="newest messages re-checked each incremental poll (default 200)")
     p_setup.set_defaults(func=_setup)
 
     p_serve = sub.add_parser("serve", help="run the IMAP/SMTP bridge")
