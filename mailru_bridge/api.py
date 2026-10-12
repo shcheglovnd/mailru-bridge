@@ -495,6 +495,13 @@ class MailruApi:
             raise ApiError("attaches/add: no attachment id returned", body=body) from None
 
     async def send(self, msg: OutgoingMessage) -> Any:
+        return await self._compose("api/v1/messages/send", msg)
+
+    async def save_draft(self, msg: OutgoingMessage) -> Any:
+        """Save a draft (``api/v1/messages/draft``) — same body as send, nothing is dispatched."""
+        return await self._compose("api/v1/messages/draft", msg)
+
+    async def _compose(self, path: str, msg: OutgoingMessage) -> Any:
         attaches = []
         for att in msg.attachments:
             att_id = await self.upload_attachment(att)
@@ -513,6 +520,7 @@ class MailruApi:
         if msg.bcc:
             correspondents["bcc"] = ", ".join(msg.bcc)
         form = [
+            ("id", _new_message_id()),
             ("attaches", _dumps({"list": attaches})),
             ("body", _dumps(body)),
             ("correspondents", _dumps(correspondents)),
@@ -529,7 +537,17 @@ class MailruApi:
             source["forward"] = msg.forward_of_id
         if source:
             form.append(("source", _dumps(source)))
-        return (await self._call("api/v1/messages/send", [("htmlencoded", "false")], form=form)).get("body")
+        return (await self._call(path, [("htmlencoded", "false")], form=form)).get("body")
+
+
+_MSG_ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+
+def _new_message_id() -> str:
+    """A client-generated message id, as the app does (``RandomStringGenerator.generateString(32)``)."""
+    import secrets
+
+    return "".join(secrets.choice(_MSG_ID_ALPHABET) for _ in range(32))
 
 
 def _dumps(obj: Any) -> str:

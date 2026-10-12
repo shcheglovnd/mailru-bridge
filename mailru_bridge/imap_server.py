@@ -683,7 +683,11 @@ class ImapConnection:
         ids = [self.s.cache.message_by_uid(self.selected, uid).mailru_id for _, uid in to_delete
                if self.s.cache.message_by_uid(self.selected, uid)]
         if ids:
-            await self.s.api.remove(ids)
+            # Mail.ru only permanently removes from Trash/Spam; elsewhere "delete" = move to Trash.
+            if self.selected in ("500002", "950"):
+                await self.s.api.remove(ids)
+            else:
+                await self.s.api.move(ids, "500002")
         for seq, uid in sorted(to_delete, reverse=True):
             self.s.cache.forget(self.selected, [uid])
             idx = self.snapshot.index(uid)
