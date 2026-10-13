@@ -14,6 +14,11 @@ state/
 trace/
 *.trace.jsonl
 account.json
+bridge.json
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
 *.eml
 *.mbox
 Maildir/
@@ -22,3 +27,5 @@ Maildir/
 *.apk
 *.xapk
 jadx-out/
+/re/
+*.dex

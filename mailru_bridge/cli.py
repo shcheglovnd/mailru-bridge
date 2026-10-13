@@ -106,9 +106,9 @@ def _setup(args: argparse.Namespace) -> int:
         return 1
     cfg = BridgeConfig.load() or BridgeConfig()
     cfg.username = args.username or cfg.username or account.email
-    if args.imap_port:
+    if args.imap_port is not None:
         cfg.imap_port = args.imap_port
-    if args.smtp_port:
+    if args.smtp_port is not None:
         cfg.smtp_port = args.smtp_port
     if args.bind:
         cfg.bind_host = args.bind
@@ -116,11 +116,11 @@ def _setup(args: argparse.Namespace) -> int:
         cfg.tls_cert = args.tls_cert
     if args.tls_key:
         cfg.tls_key = args.tls_key
-    if args.poll:
+    if args.poll is not None:
         cfg.poll_seconds = args.poll
-    if args.initial_depth:
+    if args.initial_depth is not None:
         cfg.initial_depth = args.initial_depth
-    if args.sync_window:
+    if args.sync_window is not None:
         cfg.sync_window = args.sync_window
     if args.alert_command is not None:
         cfg.alert_command = args.alert_command
@@ -131,7 +131,11 @@ def _setup(args: argparse.Namespace) -> int:
             print("Passwords do not match.", file=sys.stderr)
             return 1
         cfg.password_hash = hash_password(pw)
-    cfg.save()
+    try:
+        cfg.save()
+    except ValueError as exc:
+        print(f"Invalid configuration: {exc}", file=sys.stderr)
+        return 1
     print(f"Bridge configured. Clients log in as {cfg.username!r}.")
     print(f"  IMAP: {cfg.bind_host}:{cfg.imap_port}   SMTP: {cfg.bind_host}:{cfg.smtp_port}   TLS: {cfg.tls}")
     print("Start it with `mailru-bridge serve`.")
@@ -161,7 +165,11 @@ def _serve(args: argparse.Namespace) -> int:
     if cfg is None or not cfg.password_hash:
         print("Run `mailru-bridge setup` first to set the bridge password.", file=sys.stderr)
         return 1
-    service = BridgeService(account, cfg)
+    try:
+        service = BridgeService(account, cfg)
+    except ValueError as exc:
+        print(f"Invalid configuration: {exc}", file=sys.stderr)
+        return 1
     try:
         asyncio.run(service.run())
     except KeyboardInterrupt:

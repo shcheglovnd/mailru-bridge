@@ -42,9 +42,14 @@
       (returns `{"id":…}`), arrived in Inbox in ~5s, and the server filed the Sent copy itself.
       `send`/`draft` require a client-generated 32-char `id`; delete is permanent only from
       Trash/Spam, else move to Trash.
-- [ ] Draft APPEND via `messages/draft` (currently sends; draft endpoint wiring is a follow-up).
-- [ ] Run under systemd; reach it over WireGuard; TLS cert from the home CA.
-- [ ] Richer SEARCH (header/body/date predicates) — currently ALL/SEEN/FLAGGED.
+- [x] Draft APPEND via `messages/draft`, sharing SMTP's MIME/attachment conversion; saving never sends.
+- [x] Run under systemd; reach it over WireGuard; TLS cert from the home CA.
+- [x] Review fixes: authentication required for all mailbox commands, read-only enforcement, safe
+      UID `*`/MOVE/EXPUNGE, multiple-client snapshots, local deletion marks preserved during sync,
+      empty/deleted folders reconciled, SMTP transaction/DATA handling, safe mutation retry policy,
+      credential-free command logging and saved-login reload. Regression tests include local sockets.
+- [ ] Richer SEARCH (header/body/date predicates) — flags, sequence/UID sets and boolean combinations
+      work; unsupported keys are rejected explicitly.
 - [ ] Packaging and client setup docs for Thunderbird / FairEmail.
 
 ### Resolved questions

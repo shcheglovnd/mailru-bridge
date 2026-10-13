@@ -17,10 +17,9 @@ So this module:
 4. lets the server redirect to the app sentinel ``https://mobile-auth/success`` and, on
    the way, set a *trusted-device* ``tsa`` cookie.
 
-The caller then repeats the password login carrying that ``tsa`` cookie, which the backend
-accepts without a second step and answers with the OAuth tokens (this mirrors the app's
-own ``RequestMapper`` → ``PasswordAuth(tsaCookie=…)`` behaviour). The ``tsa`` cookie is
-long-lived, so later logins skip the SMS entirely.
+The caller exchanges the sentinel's AG token for OAuth tokens using
+``Authenticator.exchange_ag_token``. The trusted-device ``tsa`` cookie is long-lived, so later
+password logins can skip the SMS entirely.
 
 Field names and the flow are taken from the decompiled app (``CommonAuthorizationMailApi``,
 ``CommonWebViewClient``, ``MobileAuthUrlHandler``) and from the page bundle ``page2fa``.

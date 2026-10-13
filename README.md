@@ -67,10 +67,13 @@ Use your Mail.ru address as the username and the **bridge** password you just se
 
 | | Server | Port | Security |
 |---|---|---|---|
-| IMAP | your bridge host | 1143 | STARTTLS/SSL if you set a cert, else none (VPN only) |
+| IMAP | your bridge host | 1143 | SSL/TLS if you set a cert, else none (VPN only) |
 | SMTP | your bridge host | 1025 | same |
 
-Let the **server manage Sent and Drafts** (the API files sent mail in Sent itself). The first time
+TLS is **implicit TLS** from connection start; select SSL/TLS in the client.
+Let the **server manage Sent** (the API files sent mail in Sent itself); disable the client's
+additional Sent copy. Draft APPEND saves through `messages/draft`, including attachments, without
+dispatching mail. The first time
 a large folder is opened the bridge syncs its newest messages (configurable depth) into a local
 cache; later opens are served from the cache and only new mail is fetched.
 
@@ -78,7 +81,20 @@ What works: folder list, message list, reading (headers shown without downloadin
 message; the full source is fetched once when you open a message and then cached), mark read/unread
 and flagged, move, delete (to Trash), create/rename/delete folders, IDLE, and sending with
 attachments. `COPY` is not supported (Mail.ru has no copy — use move); arbitrary `APPEND` is limited
-(Sent/Drafts are server-managed).
+(only Drafts is supported; Sent APPEND returns an error rather than claiming to store a copy).
+SEARCH supports flags, sequence/UID sets, AND, OR, NOT and grouping. Unsupported text/date
+predicates return an error. Read-only `EXAMINE` sessions cannot modify mail.
+
+## Development checks
+
+```sh
+pip install -e '.[dev]'
+python -m pytest -q
+```
+
+Tests use temporary caches, mocked API requests, and local IMAP/SMTP sockets; they do not send or
+delete real mail. They cover authentication gates, UID ranges and scoped expunges, draft safety,
+multiple-client sync, SMTP transaction state, oversized DATA recovery, MIME and credential logging.
 
 ## Privacy & safety
 

@@ -209,6 +209,7 @@ class RateLimiter:
 
     def penalize(self, seconds: float) -> None:
         self._penalty = min(max(self._penalty, seconds), 300.0)
+        self._next = max(self._next, time.monotonic() + self._penalty)
 
 
 # -- client -----------------------------------------------------------------------------------
@@ -255,6 +256,17 @@ class MailruApi:
     async def refresh_token(self, stale: str | None = None) -> str:
         """Refresh the access token. ``stale`` is the token the server just rejected."""
         async with self._refresh_lock:
+            # `login` runs in a separate process. Adopt its newly saved credentials so an
+            # auth-failure alert can be resolved without restarting the running bridge.
+            saved = Account.load()
+            if (saved is not None and saved.email.lower() == self.account.email.lower()
+                    and saved.device.device_id == self.account.device.device_id
+                    and saved.refresh_token and saved.refresh_token != self.account.refresh_token):
+                self.account.refresh_token = saved.refresh_token
+                self.account.access_token = saved.access_token
+                self.account.access_expires_at = saved.access_expires_at
+                self.account.tsa_cookie = saved.tsa_cookie
+                log.info("loaded credentials from a new login")
             # Another task may have refreshed while we waited for the lock.
             if self.account.access_token_valid and self.account.access_token != stale:
                 return self.account.access_token
@@ -273,16 +285,25 @@ class MailruApi:
             try:
                 resp = await self.client.post(url, data=form, headers={"User-Agent": USER_AGENT})
             except httpx.HTTPError as exc:
-                raise ApiError(f"Token refresh failed: {exc}") from exc
+                raise ApiError(f"Token refresh failed: {type(exc).__name__}") from None
             try:
                 body = resp.json()
             except ValueError:
                 body = {}
             container = Authenticator._token_container(body if isinstance(body, dict) else {})
+            if resp.status_code == 429:
+                self.limiter.penalize(30.0)
+                raise RateLimited("Token refresh rate limited; retry later.", 429)
+            if resp.status_code >= 500:
+                self.limiter.penalize(5.0)
+                raise ApiError(f"Token refresh unavailable (HTTP {resp.status_code}).", resp.status_code)
             if resp.status_code != 200 or container is None:
-                raise self._auth_expired(
-                    f"Token refresh failed (HTTP {resp.status_code}); run `mailru-bridge login`."
-                )
+                if resp.status_code in (400, 401, 403):
+                    raise self._auth_expired(
+                        f"Token refresh rejected (HTTP {resp.status_code}); run `mailru-bridge login`."
+                    )
+                raise ApiError(f"Unexpected token refresh response (HTTP {resp.status_code}).",
+                               resp.status_code)
             from .auth import Tokens
 
             apply_tokens(
@@ -317,9 +338,14 @@ class MailruApi:
         files: dict | None = None,
         binary: bool = False,
         retries: int = 3,
+        retry_safe: bool | None = None,
     ) -> Any:
         """Perform one API call; return the JSON envelope (or raw bytes for ``binary``)."""
         query = list(query or [])
+        # A timed-out mutation may already have happened. Replaying send/draft/upload can
+        # duplicate mail; only reads and explicitly idempotent calls may retry automatically.
+        if retry_safe is None:
+            retry_safe = form is None and files is None
         attempt = 0
         refreshed = False
         while True:
@@ -340,8 +366,8 @@ class MailruApi:
                 else:
                     resp = await self.client.get(url, headers=headers)
             except httpx.HTTPError as exc:
-                if attempt > retries:
-                    raise ApiError(f"{path}: network error: {exc}") from exc
+                if not retry_safe or attempt > retries:
+                    raise ApiError(f"{path}: network error ({type(exc).__name__})") from None
                 await asyncio.sleep(min(2**attempt, 30))
                 continue
 
@@ -350,7 +376,7 @@ class MailruApi:
                 raise RateLimited(f"{path}: HTTP 429", 429)
             if resp.status_code >= 500:
                 self.limiter.penalize(5.0)
-                if attempt > retries:
+                if not retry_safe or attempt > retries:
                     raise ApiError(f"{path}: HTTP {resp.status_code}", resp.status_code)
                 await asyncio.sleep(min(2**attempt, 30))
                 continue
@@ -390,21 +416,21 @@ class MailruApi:
                 raise RateLimited(f"{path}: status 429", status, body)
             if status >= 500:
                 self.limiter.penalize(5.0)
-                if attempt > retries:
+                if not retry_safe or attempt > retries:
                     raise ApiError(f"{path}: status {status}", status, body)
                 await asyncio.sleep(min(2**attempt, 30))
                 continue
             if status == 404 or _is_not_found(body):
-                raise NotFound(f"{path}: not found ({json.dumps(body, ensure_ascii=False)[:200]})", status, body)
-            raise ApiError(
-                f"{path}: status {status} ({json.dumps(body, ensure_ascii=False)[:300]})", status, body
-            )
+                raise NotFound(f"{path}: not found", status, body)
+            raise ApiError(f"{path}: status {status}", status, body)
 
     # -- reading ---------------------------------------------------------------------------
 
     async def folders(self) -> list[RemoteFolder]:
         body = (await self._call("api/v1/folders")).get("body")
-        return [RemoteFolder.from_json(f) for f in body or [] if isinstance(f, dict)]
+        if not isinstance(body, list) or any(not isinstance(f, dict) or "id" not in f for f in body):
+            raise ApiError("folders: unexpected body", body=body)
+        return [RemoteFolder.from_json(f) for f in body]
 
     async def messages(
         self, folder: str, offset: int = 0, limit: int = 100, last_modified: int = 0
@@ -422,10 +448,19 @@ class MailruApi:
         body = envelope.get("body")
         if not isinstance(body, dict):
             raise ApiError("messages/status: unexpected body", body=body)
-        msgs = [RemoteMessage.from_json(m) for m in body.get("messages") or [] if isinstance(m, dict)]
+        items = body.get("messages")
+        if not isinstance(items, list) or any(not isinstance(m, dict) or "id" not in m for m in items):
+            raise ApiError("messages/status: unexpected message list", body=body)
+        try:
+            total = int(body["messages_total"])
+        except (KeyError, ValueError, TypeError):
+            raise ApiError("messages/status: missing or invalid total", body=body) from None
+        if total < 0 or total < len(items):
+            raise ApiError("messages/status: inconsistent total", body=body)
+        msgs = [RemoteMessage.from_json(m) for m in items]
         return MessagePage(
             messages=msgs,
-            total=int(body.get("messages_total") or 0),
+            total=total,
             last_modified=int(envelope.get("last_modified") or 0),
         )
 
@@ -435,6 +470,7 @@ class MailruApi:
             "api/v1/messages/message/download",
             form=[("id", message_id), ("folder_id", str(folder))],
             binary=True,
+            retry_safe=True,
         )
         if not isinstance(data, (bytes, bytearray)):
             raise ApiError(f"download {message_id}: no message source returned", body=data)
@@ -460,7 +496,7 @@ class MailruApi:
             marks.append({"name": "flagged", "set": list(flag), "unset": list(unflag), "folder": fid})
         if not marks:
             return
-        await self._call("api/v1/messages/marks", form=[("marks", _dumps(marks))])
+        await self._call("api/v1/messages/marks", form=[("marks", _dumps(marks))], retry_safe=True)
 
     async def move(self, ids: list[str], folder: str) -> None:
         await self._call(

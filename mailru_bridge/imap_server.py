@@ -21,15 +21,18 @@ import re
 import ssl
 from email.utils import formatdate
 
-from .api import ApiError, AuthExpired, MailruApi, OutgoingMessage
+from .api import ApiError, AuthExpired, MailruApi
 from .cache import Cache, CachedMessage
 from .config import BridgeConfig
 from .imap_struct import bodystructure, envelope, envelope_from_meta
 from .imap_utf7 import decode as u7decode, encode as u7encode
 from .mime import Message as MimeMessage
+from .outgoing import build_draft
+from .search import compile_search
 from .sync import Syncer
 
 log = logging.getLogger(__name__)
+MAX_LITERAL = 40 * 1024 * 1024
 
 # Fixed Mail.ru folder ids we give IMAP special-use flags / names.
 SPECIAL = {
@@ -53,6 +56,7 @@ class MailboxTree:
         self.refresh()
 
     def refresh(self) -> None:
+        self.special = {}
         rows = self.cache.folders()
         names: dict[str, str] = {}
         paths: dict[str, str] = {}
@@ -90,13 +94,15 @@ def _wire_name(path: str) -> bytes:
     return b'"' + u7encode(path).replace(b"\\", b"\\\\").replace(b'"', b'\\"') + b'"'
 
 
-def parse_sequence_set(spec: str, uids: list[int], max_val: int) -> list[int]:
+def parse_sequence_set(spec: str, uids: list[int], max_val: int) -> list[tuple[int, int]]:
     """Expand an IMAP sequence/UID set like ``1:4,7,9:*`` into the matching values from ``uids``.
 
     ``uids`` is the ordered pool to pick from (sequence numbers map to positions; UIDs filter by
     membership). ``max_val`` is used for ``*``.
     """
-    result: list[int] = []
+    if not re.fullmatch(r"(?:[1-9][0-9]*|\*)(?::(?:[1-9][0-9]*|\*))?(?:,(?:[1-9][0-9]*|\*)(?::(?:[1-9][0-9]*|\*))?)*", spec):
+        raise ValueError("invalid sequence set")
+    result: list[tuple[int, int]] = []
     for piece in spec.split(","):
         piece = piece.strip()
         if not piece:
@@ -123,6 +129,7 @@ class ImapConnection:
         self.selected: str | None = None  # folder id
         self.readonly = False
         self.snapshot: list[int] = []  # seq (1-based) -> uid, ascending
+        self.snapshot_flags: dict[int, set[str]] = {}
         self.peer = writer.get_extra_info("peername")
         self._idle = False
 
@@ -136,6 +143,9 @@ class ImapConnection:
         try:
             data = await self.reader.readuntil(b"\n")
         except (asyncio.IncompleteReadError, ConnectionError):
+            return None
+        except asyncio.LimitOverrunError:
+            await self.untagged("BYE command line too long")
             return None
         return data.rstrip(b"\r\n")
 
@@ -152,6 +162,7 @@ class ImapConnection:
             return None
         tokens: list[tuple[str, bytes]] = []
         buf = line
+        size = len(line)
         while True:
             m = re.search(rb"\{(\d+)(\+)?\}$", buf)
             if not m:
@@ -159,6 +170,10 @@ class ImapConnection:
                 break
             tokens.append(("t", buf[: m.start()]))
             n = int(m.group(1))
+            size += n
+            if size > (MAX_LITERAL if self.authed else 65536):
+                await self.untagged("BYE command literal too large")
+                return None
             if not m.group(2):
                 await self.send(b"+ Ready for literal data")
             try:
@@ -171,6 +186,7 @@ class ImapConnection:
                 tokens.append(("t", b""))
                 break
             buf = nxt
+            size += len(nxt)
         return tokens
 
     # -- helpers ---------------------------------------------------------------------------
@@ -186,9 +202,7 @@ class ImapConnection:
         out = []
         n = len(self.snapshot)
         if by_uid:
-            maxuid = self.snapshot[-1] if self.snapshot else 0
             for lo, hi in ranges:
-                lo = maxuid if lo == 0 else lo
                 for seq, uid in enumerate(self.snapshot, 1):
                     if lo <= uid <= hi:
                         out.append((seq, uid))
@@ -204,6 +218,10 @@ class ImapConnection:
                 seen.add(item)
                 uniq.append(item)
         return uniq
+
+    def _ranges(self, spec: str, by_uid: bool) -> list[tuple[int, int]]:
+        maximum = max(self.snapshot, default=0) if by_uid else len(self.snapshot)
+        return parse_sequence_set(spec, self.snapshot, maximum)
 
     # -- command loop ----------------------------------------------------------------------
 
@@ -221,10 +239,12 @@ class ImapConnection:
                 await self._fail_all("session expired; re-run `mailru-bridge login`", exc)
             except ApiError as exc:
                 log.warning("api error: %s", exc)
-                await self.last_tagged("NO", f"upstream error: {exc}")
+                await self.last_tagged("NO", "upstream request failed")
+            except (ValueError, IndexError):
+                await self.last_tagged("BAD", "invalid command arguments")
             except Exception as exc:  # noqa: BLE001 — never kill the connection on one bad command
                 log.exception("command failed")
-                await self.last_tagged("BAD", f"internal error: {exc}")
+                await self.last_tagged("NO", "internal error")
         try:
             self.writer.close()
         except Exception:
@@ -249,10 +269,23 @@ class ImapConnection:
         rest = head[2] if len(head) > 2 else b""
         rest_tokens: list[tuple[str, bytes]] = [("t", rest)] + tokens[1:]
 
+        if not self.authed and command not in {"CAPABILITY", "NOOP", "LOGOUT", "ID", "LOGIN", "AUTHENTICATE"}:
+            await self.tagged(tag, "NO", "LOGIN first")
+            return True
+        if self.authed and command in {"LOGIN", "AUTHENTICATE"}:
+            await self.tagged(tag, "BAD", "already authenticated")
+            return True
+        operation = rest.split(b" ", 1)[0].upper().decode("ascii", "replace") if command == "UID" else command
+        if operation in {"FETCH", "STORE", "SEARCH", "MOVE", "COPY", "EXPUNGE", "CHECK", "CLOSE", "UNSELECT", "IDLE"} and not self.selected:
+            await self.tagged(tag, "NO", "no mailbox selected")
+            return True
+        if self.readonly and operation in {"STORE", "MOVE", "EXPUNGE"}:
+            await self.tagged(tag, "NO", "mailbox is read-only")
+            return True
+
         import time as _t
 
         t0 = _t.monotonic()
-        preview = rest[:80].decode("latin-1", "replace")
         try:
             if command == "UID":
                 return await self.cmd_uid(tag, rest, rest_tokens)
@@ -264,8 +297,8 @@ class ImapConnection:
         finally:
             dt = _t.monotonic() - t0
             if dt > 1.0:
-                log.info("IMAP[%s] %s %s -> %.1fs (snap=%d)",
-                         self.peer[0] if self.peer else "?", command, preview, dt, len(self.snapshot))
+                log.info("IMAP[%s] %s -> %.1fs (snap=%d)",
+                         self.peer[0] if self.peer else "?", command, dt, len(self.snapshot))
 
     # -- basic -----------------------------------------------------------------------------
 
@@ -290,6 +323,16 @@ class ImapConnection:
         await self.tagged(tag, "OK", "ID completed")
         return True
 
+    async def cmd_namespace(self, tag, rest, tokens) -> bool:
+        await self.untagged('NAMESPACE (("" "/")) NIL NIL')
+        await self.tagged(tag, "OK", "NAMESPACE completed")
+        return True
+
+    async def cmd_check(self, tag, rest, tokens) -> bool:
+        await self.poll_selected()
+        await self.tagged(tag, "OK", "CHECK completed")
+        return True
+
     async def cmd_login(self, tag, rest, tokens) -> bool:
         args = _split_astrings(tokens)
         if len(args) < 2:
@@ -297,7 +340,7 @@ class ImapConnection:
             return True
         user = _astr(args[0])
         pw = _astr(args[1])
-        if self.s.config.check_login(user, pw):
+        if await asyncio.to_thread(self.s.config.check_login, user, pw):
             self.authed = True
             await self.tagged(tag, "OK", "LOGIN completed")
         else:
@@ -316,12 +359,14 @@ class ImapConnection:
         await self.send(b"+ ")
         line = await self.read_line()
         try:
-            decoded = base64.b64decode(line).split(b"\x00")
+            decoded = base64.b64decode(line, validate=True).split(b"\x00")
+            if len(decoded) != 3 or (decoded[0] and decoded[0] != decoded[1]):
+                raise ValueError("invalid authorization identity")
             user, pw = decoded[1].decode(), decoded[2].decode()
         except Exception:
             await self.tagged(tag, "NO", "invalid SASL response")
             return True
-        if self.s.config.check_login(user, pw):
+        if await asyncio.to_thread(self.s.config.check_login, user, pw):
             self.authed = True
             await self.tagged(tag, "OK", "AUTHENTICATE completed")
         else:
@@ -340,7 +385,13 @@ class ImapConnection:
             return True
         await self.s.refresh_tree()
         args = _split_astrings(tokens)
-        pattern = _astr(args[1]) if len(args) > 1 else "*"
+        reference = _mailbox_name(args[0]) if args else ""
+        pattern = _mailbox_name(args[1]) if len(args) > 1 else "*"
+        if not pattern:
+            await self.untagged(b'LIST (\\Noselect) "/" ""')
+            await self.tagged(tag, "OK", "LIST completed")
+            return True
+        pattern = reference + pattern
         regex = _wildcard_to_regex(pattern)
         for fid, path in sorted(self.s.tree.by_id.items(), key=lambda kv: kv[1]):
             if regex.match(path) or (path.upper() == "INBOX" and regex.match("INBOX")):
@@ -366,7 +417,7 @@ class ImapConnection:
 
     async def cmd_status(self, tag, rest, tokens) -> bool:
         args = _split_astrings(tokens)
-        name = _astr(args[0])
+        name = _mailbox_name(args[0])
         fid = self.s.tree.id_for(name)
         if fid is None:
             await self.tagged(tag, "NO", "no such mailbox")
@@ -395,7 +446,7 @@ class ImapConnection:
             await self.tagged(tag, "NO", "LOGIN first")
             return True
         args = _split_astrings(tokens)
-        name = _astr(args[0])
+        name = _mailbox_name(args[0])
         fid = self.s.tree.id_for(name)
         if fid is None:
             await self.tagged(tag, "NO", "no such mailbox")
@@ -409,7 +460,8 @@ class ImapConnection:
         await self.untagged(f"{exists} EXISTS")
         await self.untagged("0 RECENT")
         await self.untagged(r'FLAGS (\Seen \Flagged \Answered \Deleted \Draft $Forwarded)')
-        await self.untagged(r'OK [PERMANENTFLAGS (\Seen \Flagged \Answered \Deleted $Forwarded)] limited')
+        await self.untagged('OK [PERMANENTFLAGS ()] read-only' if readonly else
+                            r'OK [PERMANENTFLAGS (\Seen \Flagged \Answered \Deleted $Forwarded)] limited')
         await self.untagged(f"OK [UIDVALIDITY {folder['uidvalidity']}] validity")
         await self.untagged(f"OK [UIDNEXT {folder['uidnext']}] next")
         if unseen:
@@ -458,7 +510,7 @@ class ImapConnection:
 
     async def cmd_delete(self, tag, rest, tokens) -> bool:
         args = _split_astrings(tokens)
-        fid = self.s.tree.id_for(_astr(args[0]))
+        fid = self.s.tree.id_for(_mailbox_name(args[0]))
         if fid is None:
             await self.tagged(tag, "NO", "no such mailbox")
             return True
@@ -473,7 +525,7 @@ class ImapConnection:
 
     async def cmd_rename(self, tag, rest, tokens) -> bool:
         args = _split_astrings(tokens)
-        fid = self.s.tree.id_for(_astr(args[0]))
+        fid = self.s.tree.id_for(_mailbox_name(args[0]))
         if fid is None:
             await self.tagged(tag, "NO", "no such mailbox")
             return True
@@ -493,6 +545,7 @@ class ImapConnection:
     def _rebuild_snapshot(self) -> None:
         msgs = self.s.cache.messages(self.selected)
         self.snapshot = [m.uid for m in msgs]
+        self.snapshot_flags = {m.uid: set(m.flags) for m in msgs}
 
     def _first_unseen(self) -> int | None:
         for seq, uid in enumerate(self.snapshot, 1):
@@ -505,9 +558,12 @@ class ImapConnection:
         """Re-sync the selected folder and emit EXISTS/EXPUNGE for any change."""
         if not self.selected:
             return
-        new, expunged = await self.s.incremental(self.selected)
-        if not new and not expunged:
-            return
+        await self.s.incremental(self.selected)
+        # Another connection or the background poll may have already applied the sync.
+        # Compare this connection's view with the cache rather than relying on that sync's delta.
+        messages = self.s.cache.messages(self.selected)
+        live = {m.uid for m in messages}
+        expunged = set(self.snapshot) - live
         # EXPUNGE first (highest seq first), against the old snapshot
         if expunged:
             exp_set = set(expunged)
@@ -515,13 +571,20 @@ class ImapConnection:
                 if self.snapshot[seq - 1] in exp_set:
                     await self.untagged(f"{seq} EXPUNGE")
                     del self.snapshot[seq - 1]
-        if new:
+        if live - set(self.snapshot):
             # append newly-arrived uids (ascending) to the snapshot
             current = set(self.snapshot)
-            for cm in self.s.cache.messages(self.selected):
+            for cm in messages:
                 if cm.uid not in current:
                     self.snapshot.append(cm.uid)
             await self.untagged(f"{len(self.snapshot)} EXISTS")
+        by_uid = {m.uid: m for m in messages}
+        for seq, uid in enumerate(self.snapshot, 1):
+            cm = by_uid[uid]
+            if uid in self.snapshot_flags and cm.flags != self.snapshot_flags[uid]:
+                await self.untagged(b"%d FETCH (UID %d FLAGS (" % (seq, uid)
+                                    + " ".join(sorted(cm.flags)).encode() + b"))")
+        self.snapshot_flags = {m.uid: set(m.flags) for m in messages}
 
     # -- FETCH -----------------------------------------------------------------------------
 
@@ -535,7 +598,7 @@ class ImapConnection:
             return True
         seqset = m.group(1).decode("latin-1")
         items_spec = m.group(2).decode("latin-1").strip()
-        ranges = parse_sequence_set(seqset, self.snapshot, len(self.snapshot))
+        ranges = self._ranges(seqset, by_uid)
         targets = self._resolve(ranges, by_uid)
         items = _parse_fetch_items(items_spec)
         # If any item needs the raw message, download all of them concurrently (bounded) before
@@ -654,10 +717,15 @@ class ImapConnection:
             return True
         seqset = m.group(1).decode("latin-1")
         op = m.group(2).decode("latin-1").upper()
-        flags = set(f for f in m.group(3).decode("latin-1").split() if f)
+        canonical = {f.lower(): f for f in ("\\Seen", "\\Flagged", "\\Answered", "\\Deleted", "$Forwarded")}
+        requested = m.group(3).decode("latin-1").split()
+        if any(f.lower() not in canonical for f in requested):
+            await self.tagged(tag, "NO", "unsupported flag")
+            return True
+        flags = {canonical[f.lower()] for f in requested}
         silent = "SILENT" in op
         mode = "+" if op.startswith("+") else "-" if op.startswith("-") else "="
-        ranges = parse_sequence_set(seqset, self.snapshot, len(self.snapshot))
+        ranges = self._ranges(seqset, by_uid)
         for seq, uid in self._resolve(ranges, by_uid):
             newflags = await self.s.apply_flags(self.selected, uid, mode, flags)
             if not silent:
@@ -680,18 +748,19 @@ class ImapConnection:
         if len(args) < 2:
             await self.tagged(tag, "BAD", "MOVE syntax")
             return True
-        dest = self.s.tree.id_for(_astr(args[1]))
+        dest = self.s.tree.id_for(_mailbox_name(args[1]))
         if dest is None:
             await self.tagged(tag, "NO", "no such destination mailbox")
             return True
-        ranges = parse_sequence_set(_astr(args[0]), self.snapshot, len(self.snapshot))
+        ranges = self._ranges(_astr(args[0]), by_uid)
         targets = self._resolve(ranges, by_uid)
         ids = [self.s.cache.message_by_uid(self.selected, uid).mailru_id for _, uid in targets
                if self.s.cache.message_by_uid(self.selected, uid)]
         if ids:
-            await self.s.api.move(ids, dest)
             uids = [uid for _, uid in targets]
-            self.s.cache.forget(self.selected, uids)
+            async with self.s._lock:
+                await self.s.api.move(ids, dest)
+                self.s.cache.forget(self.selected, uids)
             exp_set = set(uids)
             for seq in range(len(self.snapshot), 0, -1):
                 if self.snapshot[seq - 1] in exp_set:
@@ -710,9 +779,13 @@ class ImapConnection:
         await self.tagged(tag, "OK", "EXPUNGE completed")
         return True
 
-    async def _expunge(self, silent: bool) -> None:
+    async def _expunge(self, silent: bool, uids: set[int] | None = None) -> None:
+        async with self.s._lock:
+            await self._expunge_locked(silent, uids)
+
+    async def _expunge_locked(self, silent: bool, uids: set[int] | None) -> None:
         to_delete = [(seq, uid) for seq, uid in enumerate(self.snapshot, 1)
-                     if self._has_deleted(uid)]
+                     if self._has_deleted(uid) and (uids is None or uid in uids)]
         if not to_delete:
             return
         ids = [self.s.cache.message_by_uid(self.selected, uid).mailru_id for _, uid in to_delete
@@ -740,7 +813,16 @@ class ImapConnection:
         if not self.selected:
             await self.tagged(tag, "NO", "no mailbox selected")
             return True
-        results = await self.s.search(self.selected, self.snapshot, rest.decode("utf-8", "replace"))
+        try:
+            predicate = compile_search(_split_astrings(tokens), _split_astrings, self._ranges)
+        except ValueError as exc:
+            await self.tagged(tag, "BAD", str(exc))
+            return True
+        results = []
+        for seq, uid in enumerate(self.snapshot, 1):
+            cm = self.s.cache.message_by_uid(self.selected, uid)
+            if cm is not None and predicate(cm, seq):
+                results.append(seq)
         if by_uid:
             values = [self.snapshot[seq - 1] for seq in results]
         else:
@@ -757,11 +839,11 @@ class ImapConnection:
         if not args:
             await self.tagged(tag, "BAD", "APPEND syntax")
             return True
-        name = _astr(args[0])
+        name = _mailbox_name(args[0])
         fid = self.s.tree.id_for(name)
         literal = next((data for kind, data in tokens if kind == "l"), None)
-        if fid in ("500000",):  # Sent: the server already stores sent mail; accept to avoid dup
-            await self.tagged(tag, "OK", "APPEND accepted (server-managed Sent)")
+        if fid == "500000":
+            await self.tagged(tag, "NO", "Sent is server-managed; disable client Sent APPEND")
             return True
         if fid == "500001" and literal:  # Drafts: create a draft from the message
             try:
@@ -791,6 +873,8 @@ class ImapConnection:
                     await self.poll_selected()
         finally:
             self._idle = False
+            done.cancel()
+            await asyncio.gather(done, return_exceptions=True)
         await self.tagged(tag, "OK", "IDLE terminated")
         return True
 
@@ -809,6 +893,7 @@ class ImapConnection:
             return True
         name = sub[0].upper().decode("ascii", "replace")
         remainder = sub[1]
+        tokens = [("t", remainder)] + tokens[1:]
         self._tag = tag
         if name == "FETCH":
             return await self.cmd_fetch(tag, remainder, tokens, by_uid=True)
@@ -821,7 +906,8 @@ class ImapConnection:
         if name == "MOVE":
             return await self.cmd_move(tag, remainder, tokens, by_uid=True)
         if name == "EXPUNGE":
-            await self._expunge(silent=False)
+            ranges = self._ranges(remainder.decode("ascii").strip(), by_uid=True)
+            await self._expunge(silent=False, uids={uid for _, uid in self._resolve(ranges, True)})
             await self.tagged(tag, "OK", "UID EXPUNGE completed")
             return True
         await self.tagged(tag, "BAD", f"unknown UID subcommand {name}")
@@ -835,6 +921,10 @@ def _astr(value) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", "replace")
     return value
+
+
+def _mailbox_name(value) -> str:
+    return u7decode(_astr(value))
 
 
 def _split_astrings(tokens: list[tuple[str, bytes]]) -> list:
@@ -854,7 +944,7 @@ def _split_astrings(tokens: list[tuple[str, bytes]]) -> list:
         n = len(rest)
         while i < n:
             c = rest[i : i + 1]
-            if c == b" ":
+            if c in (b" ", b"\t"):
                 i += 1
                 continue
             if c == b'"':
@@ -866,22 +956,34 @@ def _split_astrings(tokens: list[tuple[str, bytes]]) -> list:
                     buf += rest[j : j + 1]
                     j += 1
                 out.append(bytes(buf).decode("utf-8", "replace"))
+                if j >= n:
+                    raise ValueError("unterminated quoted string")
                 i = j + 1
             elif c == b"(":
                 depth = 1
                 j = i + 1
+                quoted = False
                 while j < n and depth:
-                    if rest[j : j + 1] == b"(":
+                    if rest[j : j + 1] == b"\\" and quoted:
+                        j += 2
+                        continue
+                    if rest[j : j + 1] == b'"':
+                        quoted = not quoted
+                    elif rest[j : j + 1] == b"(" and not quoted:
                         depth += 1
-                    elif rest[j : j + 1] == b")":
+                    elif rest[j : j + 1] == b")" and not quoted:
                         depth -= 1
                     j += 1
+                if depth:
+                    raise ValueError("unterminated parenthesised group")
                 out.append(rest[i:j])
                 i = j
             else:
                 j = i
-                while j < n and rest[j : j + 1] not in (b" ", b"(", b")"):
+                while j < n and rest[j : j + 1] not in (b" ", b"\t", b"(", b")"):
                     j += 1
+                if j == i:
+                    raise ValueError("unexpected closing parenthesis")
                 out.append(rest[i:j].decode("utf-8", "replace"))
                 i = j
     return out
@@ -974,7 +1076,7 @@ class ImapServer:
         self._lock = asyncio.Lock()
 
     def capabilities(self) -> str:
-        caps = ["IMAP4rev1", "AUTH=PLAIN", "IDLE", "MOVE", "UIDPLUS", "LITERAL+", "NAMESPACE", "ID", "UNSELECT"]
+        caps = ["IMAP4rev1", "AUTH=PLAIN", "IDLE", "MOVE", "LITERAL+", "NAMESPACE", "ID", "UNSELECT"]
         return " ".join(caps)
 
     def has_children(self, fid: str) -> bool:
@@ -999,93 +1101,70 @@ class ImapServer:
 
     async def ensure_initial(self, fid: str) -> None:
         """On SELECT: do the full initial sync once per folder (to initial_depth), else incremental."""
-        if not self._deep_synced(fid):
-            async with self._lock:
+        async with self._lock:
+            if not self._deep_synced(fid):
                 await self.syncer.initial_sync(fid, depth=self.config.initial_depth)
-            self.cache.set_meta(f"deep:{fid}", "1")
-        else:
-            await self.incremental(fid)
+                self.cache.set_meta(f"deep:{fid}", "1")
+            else:
+                await self.syncer.incremental_sync(fid, window=self.config.sync_window)
         self._initial.add(fid)
 
     async def sync_folder_quietly(self, fid: str) -> None:
         """For STATUS: a light touch only. Never claims a deep sync, so SELECT still loads depth."""
-        if self._deep_synced(fid):
-            await self.incremental(fid)
-        else:
-            folder = self.cache.folder(fid)
-            if folder is None or folder["last_sync"] == 0:
-                await self.syncer.initial_sync(fid, depth=min(self.config.initial_depth, 300))
+        async with self._lock:
+            if self._deep_synced(fid):
+                await self.syncer.incremental_sync(fid, window=self.config.sync_window)
+            else:
+                folder = self.cache.folder(fid)
+                if folder is None or folder["last_sync"] == 0:
+                    await self.syncer.initial_sync(fid, depth=min(self.config.initial_depth, 300))
 
     async def incremental(self, fid: str) -> tuple[int, list[int]]:
         async with self._lock:
             return await self.syncer.incremental_sync(fid, window=self.config.sync_window)
 
     async def set_seen(self, fid: str, uid: int, seen: bool) -> None:
-        cm = self.cache.message_by_uid(fid, uid)
-        if cm is None:
-            return
-        if seen:
-            await self.api.mark(fid, read=[cm.mailru_id])
-            cm.flags.add("\\Seen")
-        else:
-            await self.api.mark(fid, unread=[cm.mailru_id])
-            cm.flags.discard("\\Seen")
-        self.cache.update_flags(fid, uid, cm.flags)
-
-    async def apply_flags(self, fid: str, uid: int, mode: str, flags: set[str]) -> set[str]:
-        cm = self.cache.message_by_uid(fid, uid)
-        if cm is None:
-            return set()
-        current = set(cm.flags)
-        if mode == "=":
-            target = set(flags)
-        elif mode == "+":
-            target = current | flags
-        else:
-            target = current - flags
-        # push the deltas the API understands
-        mid = cm.mailru_id
-        was_seen, now_seen = "\\Seen" in current, "\\Seen" in target
-        was_flag, now_flag = "\\Flagged" in current, "\\Flagged" in target
-        if now_seen and not was_seen:
-            await self.api.mark(fid, read=[mid])
-        elif was_seen and not now_seen:
-            await self.api.mark(fid, unread=[mid])
-        if now_flag and not was_flag:
-            await self.api.mark(fid, flag=[mid])
-        elif was_flag and not now_flag:
-            await self.api.mark(fid, unflag=[mid])
-        self.cache.update_flags(fid, uid, target)
-        return target
-
-    async def search(self, fid: str, snapshot: list[int], criteria: str) -> list[int]:
-        """Very small SEARCH: ALL, UNSEEN/SEEN, FLAGGED, and header/body text via cached data."""
-        crit = criteria.strip().upper()
-        results = []
-        for seq, uid in enumerate(snapshot, 1):
+        async with self._lock:
             cm = self.cache.message_by_uid(fid, uid)
             if cm is None:
-                continue
-            ok = True
-            if crit in ("ALL", ""):
-                ok = True
-            elif "UNSEEN" in crit:
-                ok = not cm.seen
-            elif "SEEN" in crit:
-                ok = cm.seen
-            elif "FLAGGED" in crit:
-                ok = "\\Flagged" in cm.flags
-            elif "UNFLAGGED" in crit:
-                ok = "\\Flagged" not in cm.flags
+                return
+            if seen:
+                await self.api.mark(fid, read=[cm.mailru_id])
+                cm.flags.add("\\Seen")
             else:
-                ok = True  # unsupported predicates: don't hide messages
-            if ok:
-                results.append(seq)
-        return results
+                await self.api.mark(fid, unread=[cm.mailru_id])
+                cm.flags.discard("\\Seen")
+            self.cache.update_flags(fid, uid, cm.flags)
+
+    async def apply_flags(self, fid: str, uid: int, mode: str, flags: set[str]) -> set[str]:
+        async with self._lock:
+            cm = self.cache.message_by_uid(fid, uid)
+            if cm is None:
+                return set()
+            current = set(cm.flags)
+            if mode == "=":
+                target = set(flags)
+            elif mode == "+":
+                target = current | flags
+            else:
+                target = current - flags
+            # push the deltas the API understands
+            mid = cm.mailru_id
+            was_seen, now_seen = "\\Seen" in current, "\\Seen" in target
+            was_flag, now_flag = "\\Flagged" in current, "\\Flagged" in target
+            if now_seen and not was_seen:
+                await self.api.mark(fid, read=[mid])
+            elif was_seen and not now_seen:
+                await self.api.mark(fid, unread=[mid])
+            if now_flag and not was_flag:
+                await self.api.mark(fid, flag=[mid])
+            elif was_flag and not now_flag:
+                await self.api.mark(fid, unflag=[mid])
+            self.cache.update_flags(fid, uid, target)
+            return target
 
     async def save_draft(self, raw: bytes) -> None:
-        msg = _parse_outgoing(raw, self.account.email)
-        await self.api.send(msg)  # NOTE: draft endpoint wiring is a follow-up; see roadmap
+        await self.api.save_draft(build_draft(raw, self.account.email))
 
     async def serve(self) -> None:
         await self.sync_folders()
@@ -1113,36 +1192,3 @@ class ImapServer:
                 await writer.wait_closed()
             except Exception:
                 pass
-
-
-def _parse_outgoing(raw: bytes, default_from: str) -> OutgoingMessage:
-    import email
-    from email.policy import default as default_policy
-
-    msg = email.message_from_bytes(raw, policy=default_policy)
-    to = [a.strip() for a in (msg.get("To", "")).split(",") if a.strip()]
-    cc = [a.strip() for a in (msg.get("Cc", "")).split(",") if a.strip()]
-    bcc = [a.strip() for a in (msg.get("Bcc", "")).split(",") if a.strip()]
-    text = None
-    html = None
-    if msg.is_multipart:
-        for part in msg.walk():
-            ct = part.get_content_type()
-            if ct == "text/plain" and text is None:
-                text = part.get_content()
-            elif ct == "text/html" and html is None:
-                html = part.get_content()
-    else:
-        if msg.get_content_type() == "text/html":
-            html = msg.get_content()
-        else:
-            text = msg.get_content()
-    return OutgoingMessage(
-        sender=msg.get("From", default_from),
-        to=to,
-        cc=cc,
-        bcc=bcc,
-        subject=msg.get("Subject", ""),
-        text=text,
-        html=html,
-    )

@@ -273,6 +273,8 @@ class Message:
 
 def _split_header_body(data: bytes, start: int, end: int) -> int:
     """Return the offset of the body start (after the blank line), or ``end`` if none."""
+    if data[start : start + 2] == CRLF:
+        return start + 2  # an empty header block
     sep = data.find(b"\r\n\r\n", start, end)
     if sep < 0:
         return end
@@ -300,29 +302,17 @@ def _parse_part(data: bytes, start: int, end: int) -> Part:
 
 
 def _parse_multipart(data: bytes, start: int, end: int, boundary: bytes) -> list[Part]:
-    delim = b"--" + boundary
     children: list[Part] = []
-    # positions of each boundary line
-    marks: list[int] = []
-    pos = start
-    while True:
-        i = data.find(delim, pos, end)
-        if i < 0:
-            break
-        # must be at line start
-        if i == start or data[i - 1 : i] == b"\n":
-            marks.append(i)
-        pos = i + len(delim)
-    for idx in range(len(marks) - 1):
-        after = data.find(b"\r\n", marks[idx], end)
-        if after < 0:
-            continue
-        if data[marks[idx] + len(delim) : marks[idx] + len(delim) + 2] == b"--":
-            continue  # closing boundary
-        child_start = after + 2
-        child_end = marks[idx + 1]
+    # The entire delimiter line must match; '--BBextra' can be ordinary body text.
+    pattern = re.compile(rb"(?m)^--" + re.escape(boundary) + rb"(--)?[ \t]*(?:\r\n|$)")
+    marks = list(pattern.finditer(data, start, end))
+    for idx, mark in enumerate(marks):
+        if mark.group(1):
+            break  # closing boundary
+        child_start = mark.end()
+        child_end = marks[idx + 1].start() if idx + 1 < len(marks) else end
         # the CRLF immediately before the next boundary belongs to the boundary
-        if data[child_end - 2 : child_end] == b"\r\n":
+        if idx + 1 < len(marks) and data[child_end - 2 : child_end] == b"\r\n":
             child_end -= 2
         children.append(_parse_part(data, child_start, child_end))
     return children

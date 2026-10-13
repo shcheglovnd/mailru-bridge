@@ -31,7 +31,9 @@ def hash_password(password: str, salt: bytes | None = None) -> str:
 
 def verify_password(password: str, encoded: str) -> bool:
     try:
-        _, rounds, salt_hex, dk_hex = encoded.split("$")
+        scheme, rounds, salt_hex, dk_hex = encoded.split("$")
+        if scheme != "pbkdf2_sha256":
+            return False
         dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(rounds))
     except (ValueError, TypeError):
         return False
@@ -68,7 +70,19 @@ class BridgeConfig:
         return cls(**known)
 
     def save(self) -> None:
+        self.validate()
         write_private(self.path(), json.dumps(asdict(self), indent=2) + "\n")
+
+    def validate(self) -> None:
+        if bool(self.tls_cert) != bool(self.tls_key):
+            raise ValueError("TLS requires both a certificate and a private key")
+        for port in (self.imap_port, self.smtp_port):
+            if not 1 <= port <= 65535:
+                raise ValueError("ports must be between 1 and 65535")
+        if self.imap_port == self.smtp_port:
+            raise ValueError("IMAP and SMTP must use different ports")
+        if min(self.poll_seconds, self.initial_depth, self.sync_window) <= 0:
+            raise ValueError("poll interval and sync depths must be positive")
 
     @property
     def tls(self) -> bool:
@@ -77,5 +91,5 @@ class BridgeConfig:
     def check_login(self, username: str, password: str) -> bool:
         if not self.password_hash:
             return False
-        user_ok = hmac.compare_digest(username.lower(), self.username.lower())
+        user_ok = hmac.compare_digest(username.lower().encode("utf-8"), self.username.lower().encode("utf-8"))
         return user_ok and verify_password(password, self.password_hash)

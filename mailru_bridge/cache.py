@@ -55,6 +55,10 @@ CREATE INDEX IF NOT EXISTS ix_msg_uid ON messages(folder_id, uid);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 """
 
+# Flags controlled by Mail.ru; all other flags (notably \Deleted) are local state.
+REMOTE_FLAGS = {"\\Seen", "\\Flagged", "\\Answered", "$Forwarded"}
+MESSAGE_COLUMNS = "folder_id,uid,mailru_id,date,size,flags,deleted,meta"
+
 
 @dataclass
 class CachedMessage:
@@ -102,10 +106,15 @@ class Cache:
 
     def upsert_folder(self, fid: str, name: str, parent: str, ftype: str, system: bool,
                       total: int, unread: int) -> None:
-        with self._lock:
+        with self._lock, self._conn:
             row = self._conn.execute("SELECT uidvalidity FROM folders WHERE id=?", (fid,)).fetchone()
             if row is None:
-                uidvalidity = int(time.time())
+                previous = self._conn.execute("SELECT MAX(uidvalidity) v FROM folders").fetchone()["v"] or 0
+                uidvalidity = max(int(time.time()), previous + 1,
+                                  int(self.get_meta("uidvalidity:last", "0")) + 1)
+                self._conn.execute(
+                    "INSERT INTO meta(k,v) VALUES('uidvalidity:last',?) "
+                    "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (str(uidvalidity),))
                 self._conn.execute(
                     "INSERT INTO folders(id,name,parent,type,system,uidvalidity,total,unread) "
                     "VALUES(?,?,?,?,?,?,?,?)",
@@ -131,6 +140,16 @@ class Cache:
             self._conn.execute("UPDATE folders SET last_sync=? WHERE id=?", (when, fid))
             self._conn.commit()
 
+    def prune_folders(self, live_ids: set[str]) -> None:
+        """Remove folders absent from a successful, authoritative folder listing."""
+        with self._lock, self._conn:
+            for row in self._conn.execute("SELECT id FROM folders").fetchall():
+                fid = row["id"]
+                if fid not in live_ids:
+                    self._conn.execute("DELETE FROM messages WHERE folder_id=?", (fid,))
+                    self._conn.execute("DELETE FROM folders WHERE id=?", (fid,))
+                    self._conn.execute("DELETE FROM meta WHERE k=?", (f"deep:{fid}",))
+
     # -- messages --------------------------------------------------------------------------
 
     def uid_for(self, fid: str, mailru_id: str) -> int | None:
@@ -143,22 +162,26 @@ class Cache:
     def add_message(self, fid: str, mailru_id: str, date: int, size: int, flags: set[str],
                     meta: dict) -> int:
         """Assign and return a UID for a newly seen message (or the existing one)."""
-        with self._lock:
+        with self._lock, self._conn:
             existing = self._conn.execute(
-                "SELECT uid FROM messages WHERE folder_id=? AND mailru_id=?", (fid, mailru_id)
+                "SELECT uid,flags FROM messages WHERE folder_id=? AND mailru_id=?", (fid, mailru_id)
             ).fetchone()
             if existing:
                 # refresh flags/meta/size; keep the uid
                 self._conn.execute(
-                    "UPDATE messages SET date=?,size=?,flags=?,meta=?,deleted=0 "
+                    "UPDATE messages SET date=?,size=CASE WHEN raw IS NULL THEN ? ELSE size END,"
+                    "flags=?,meta=?,deleted=0 "
                     "WHERE folder_id=? AND mailru_id=?",
-                    (date, size, _flags_to_text(flags), json.dumps(meta, ensure_ascii=False),
+                    (date, size, _flags_to_text(flags | (_text_to_flags(existing["flags"]) - REMOTE_FLAGS)),
+                     json.dumps(meta, ensure_ascii=False),
                      fid, mailru_id),
                 )
                 self._conn.commit()
                 return existing["uid"]
             row = self._conn.execute("SELECT uidnext FROM folders WHERE id=?", (fid,)).fetchone()
-            uid = row["uidnext"] if row else 1
+            if row is None:
+                raise KeyError(f"no such folder {fid}")
+            uid = row["uidnext"]
             self._conn.execute(
                 "INSERT INTO messages(folder_id,uid,mailru_id,date,size,flags,meta) "
                 "VALUES(?,?,?,?,?,?,?)",
@@ -176,13 +199,13 @@ class Cache:
         UIDs (oldest first). Messages already present (by mailru_id) are skipped. Returns how many
         were inserted. Much faster than per-message :meth:`add_message` for an initial sync.
         """
-        with self._lock:
+        with self._lock, self._conn:
             row = self._conn.execute("SELECT uidnext FROM folders WHERE id=?", (fid,)).fetchone()
-            uid = row["uidnext"] if row else 1
-            existing = self.live_mailru_ids(fid)
-            also = {r["mailru_id"] for r in self._conn.execute(
+            if row is None:
+                raise KeyError(f"no such folder {fid}")
+            uid = row["uidnext"]
+            existing = {r["mailru_id"] for r in self._conn.execute(
                 "SELECT mailru_id FROM messages WHERE folder_id=?", (fid,)).fetchall()}
-            existing |= also
             rows = []
             for mailru_id, date, size, flags, meta in items:
                 if mailru_id in existing:
@@ -206,6 +229,25 @@ class Cache:
                 (_flags_to_text(flags), fid, uid),
             )
             self._conn.commit()
+
+    def update_remote_flags(self, fid: str, uid: int, flags: set[str]) -> None:
+        with self._lock:
+            cm = self.message_by_uid(fid, uid)
+            if cm is not None:
+                self.update_flags(fid, uid, flags | (cm.flags - REMOTE_FLAGS))
+
+    def update_remote_flags_batch(self, fid: str, flags_by_id: dict[str, set[str]]) -> None:
+        """Refresh remote flags in one transaction while retaining local deletion marks."""
+        with self._lock, self._conn:
+            updates = []
+            for row in self._conn.execute(
+                    "SELECT uid,mailru_id,flags FROM messages WHERE folder_id=?", (fid,)):
+                remote = flags_by_id.get(row["mailru_id"])
+                if remote is not None:
+                    flags = _flags_to_text(remote | (_text_to_flags(row["flags"]) - REMOTE_FLAGS))
+                    if flags != row["flags"]:
+                        updates.append((flags, fid, row["uid"]))
+            self._conn.executemany("UPDATE messages SET flags=? WHERE folder_id=? AND uid=?", updates)
 
     def set_raw(self, fid: str, uid: int, raw: bytes) -> None:
         with self._lock:
@@ -247,7 +289,7 @@ class Cache:
 
     def messages(self, fid: str, include_deleted: bool = False) -> list[CachedMessage]:
         with self._lock:
-            q = "SELECT * FROM messages WHERE folder_id=?"
+            q = f"SELECT {MESSAGE_COLUMNS} FROM messages WHERE folder_id=?"
             if not include_deleted:
                 q += " AND deleted=0"
             q += " ORDER BY uid"
@@ -257,7 +299,7 @@ class Cache:
     def message_by_uid(self, fid: str, uid: int) -> CachedMessage | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM messages WHERE folder_id=? AND uid=?", (fid, uid)
+                f"SELECT {MESSAGE_COLUMNS} FROM messages WHERE folder_id=? AND uid=?", (fid, uid)
             ).fetchone()
         return self._row_to_msg(row) if row else None
 

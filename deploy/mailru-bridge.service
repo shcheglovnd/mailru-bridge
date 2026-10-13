@@ -1,5 +1,5 @@
-# Install to /etc/systemd/system/mailru-bridge.service, then:
-#   sudo systemctl daemon-reload && sudo systemctl enable --now mailru-bridge
+# Install to /etc/systemd/system/mailru-bridge@.service, then:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now mailru-bridge@youruser
 # Adjust User/paths to your account. Binding 993/465 needs CAP_NET_BIND_SERVICE
 # (granted below); use non-privileged ports and drop the capability lines otherwise.
 [Unit]
@@ -20,6 +20,8 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
+# Run login/setup first to create this directory. Adjust for a custom state directory.
+ReadWritePaths=/home/%i/.local/state/mailru-bridge
 ProtectControlGroups=true
 ProtectKernelTunables=true
 ProtectKernelModules=true

@@ -9,9 +9,9 @@ Replicates the official app's ``AuthorizeRequestCommand`` (``ru.mail.auth.reques
   holds a ``Continue`` URL and a ``LudwigToken``.
 * An access token is refreshed at ``o2.mail.ru/token`` with ``grant_type=refresh_token``.
 
-The second-step (SMS) exchange is a web page meant for a WebView and is not fully
-reconstructed from static analysis; :meth:`Authenticator.start_password` surfaces the
-challenge so the CLI can complete it against a live account while tracing the calls.
+The second-step (SMS) exchange is a web page meant for a WebView;
+:meth:`Authenticator.start_password` surfaces the challenge so the CLI can complete it using
+``secondstep.py``, then exchange the returned AG token for OAuth credentials.
 """
 
 from __future__ import annotations

@@ -57,3 +57,19 @@ def test_body_lines():
     assert body_lines(b"a\r\nb\r\n") == 2
     assert body_lines(b"a\r\nb") == 2
     assert body_lines(b"") == 0
+
+
+def test_boundary_prefix_inside_body_is_not_a_delimiter():
+    raw = (b'Content-Type: multipart/mixed; boundary="BB"\r\n\r\n'
+           b'--BB\r\nContent-Type: text/plain\r\n\r\nhello\r\n--BBextra\r\nmore\r\n--BB--\r\n')
+    msg = Message(raw)
+    assert len(msg.root.children) == 1
+    assert msg.section_bytes("1") == b"hello\r\n--BBextra\r\nmore"
+
+
+def test_empty_mime_headers_and_missing_closing_boundary():
+    raw = (b'Content-Type: multipart/mixed; boundary="BB"\r\n\r\n'
+           b'--BB\r\n\r\nbody\r\n')
+    msg = Message(raw)
+    assert msg.section_bytes("1") == b"body\r\n"
+    assert msg.section_bytes("1.MIME") == b"\r\n"
