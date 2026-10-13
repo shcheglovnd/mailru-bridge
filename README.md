@@ -87,8 +87,11 @@ updates all cached messages in that folder on the next poll, so web "mark all as
 mail too. Older message flags are also rechecked periodically (default 15 minutes, configurable with
 `setup --flag-refresh <seconds>`); this scans message summaries down to the oldest cached message,
 without downloading bodies or resetting UIDs.
-SEARCH supports flags, sequence/UID sets, AND, OR, NOT and grouping. Unsupported text/date
-predicates return an error. Read-only `EXAMINE` sessions cannot modify mail.
+SEARCH supports flags, internal-date `BEFORE`/`ON`/`SINCE`, sequence/UID sets, AND, OR, NOT and
+grouping. Date searches used for normal FairEmail synchronization work without downloading bodies.
+Manual SEARCH polls for arrivals immediately and publishes messages added since the folder was
+opened; it does not wait for the background poll. Header/body text and sent-date predicates are
+still unsupported. Read-only `EXAMINE` sessions cannot modify mail.
 
 ## Development checks
 

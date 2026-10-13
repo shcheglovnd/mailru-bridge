@@ -1,6 +1,21 @@
-"""Flag and sequence SEARCH predicates; reject unsupported keys explicitly."""
+"""Flag, internal-date and sequence SEARCH predicates."""
 
 import re
+from datetime import date, datetime, timezone
+
+MONTHS = {name: number for number, name in enumerate(
+    ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"), 1)}
+
+
+def _search_date(value) -> date:
+    text = value.decode("ascii") if isinstance(value, bytes) else str(value)
+    match = re.fullmatch(r"([0-9]{1,2})-([A-Za-z]{3})-([0-9]{4})", text)
+    if not match or match[2].upper() not in MONTHS:
+        raise ValueError("invalid SEARCH date")
+    try:
+        return date(int(match[3]), MONTHS[match[2].upper()], int(match[1]))
+    except ValueError:
+        raise ValueError("invalid SEARCH date") from None
 
 
 def compile_search(args: list, split, ranges):
@@ -28,6 +43,17 @@ def compile_search(args: list, split, ranges):
         if key == "OR":
             left, right = parse(stream), parse(stream)
             return lambda cm, seq: left(cm, seq) or right(cm, seq)
+        if key in {"BEFORE", "ON", "SINCE"}:
+            if not stream:
+                raise ValueError("missing SEARCH date")
+            wanted = _search_date(stream.pop(0))
+
+            def matches_date(cm, seq):
+                # INTERNALDATE is exposed in UTC. SEARCH ignores its time and timezone.
+                actual = datetime.fromtimestamp(cm.date, timezone.utc).date()
+                return actual < wanted if key == "BEFORE" else actual == wanted if key == "ON" else actual >= wanted
+
+            return matches_date
         flags = {"SEEN": "\\Seen", "FLAGGED": "\\Flagged", "ANSWERED": "\\Answered",
                  "DELETED": "\\Deleted", "DRAFT": "\\Draft"}
         positive = key[2:] if key.startswith("UN") else key

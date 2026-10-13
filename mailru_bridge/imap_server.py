@@ -587,12 +587,27 @@ class ImapConnection:
                                     + " ".join(sorted(cm.flags)).encode() + b"))")
         self.snapshot_flags = {m.uid: set(m.flags) for m in messages}
 
+    async def _append_cached_arrivals(self) -> None:
+        """Publish new arrivals without renumbering existing messages during SEARCH/FETCH.
+
+        Non-UID SEARCH/FETCH must defer EXPUNGE notifications until a safe command boundary.
+        The cache may already have been updated by another connection or a background poll.
+        """
+        known = set(self.snapshot)
+        for cm in self.s.cache.messages(self.selected):
+            if cm.uid not in known:
+                self.snapshot.append(cm.uid)
+                self.snapshot_flags[cm.uid] = set(cm.flags)
+        if len(self.snapshot) != len(known):
+            await self.untagged(f"{len(self.snapshot)} EXISTS")
+
     # -- FETCH -----------------------------------------------------------------------------
 
     async def cmd_fetch(self, tag, rest, tokens, by_uid=False) -> bool:
         if not self.selected:
             await self.tagged(tag, "NO", "no mailbox selected")
             return True
+        await self._append_cached_arrivals()
         m = re.match(rb"\s*(\S+)\s+(.*)$", rest, re.DOTALL)
         if not m:
             await self.tagged(tag, "BAD", "FETCH syntax")
@@ -815,10 +830,17 @@ class ImapConnection:
             await self.tagged(tag, "NO", "no mailbox selected")
             return True
         try:
-            predicate = compile_search(_split_astrings(tokens), _split_astrings, self._ranges)
+            args = _split_astrings(tokens)
+            compile_search(args, _split_astrings, self._ranges)
         except ValueError as exc:
+            log.warning("IMAP SEARCH rejected (folder %s)", self.selected)
             await self.tagged(tag, "BAD", str(exc))
             return True
+        # A manual refresh must see arrivals now, even if the periodic poll/IDLE timer has
+        # not fired. Compile ranges after publishing them so UID '*' uses the current maximum.
+        await self.s.incremental(self.selected)
+        await self._append_cached_arrivals()
+        predicate = compile_search(args, _split_astrings, self._ranges)
         results = []
         for seq, uid in enumerate(self.snapshot, 1):
             cm = self.s.cache.message_by_uid(self.selected, uid)
@@ -829,6 +851,8 @@ class ImapConnection:
         else:
             values = results
         await self.untagged("SEARCH " + " ".join(str(v) for v in values))
+        log.info("IMAP[%s] SEARCH folder %s: %d matches",
+                 self.peer[0] if self.peer else "?", self.selected, len(values))
         await self.tagged(tag, "OK", ("UID " if by_uid else "") + "SEARCH completed")
         return True
 

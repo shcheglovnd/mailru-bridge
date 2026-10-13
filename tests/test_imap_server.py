@@ -252,3 +252,89 @@ def test_shallow_status_cache_keeps_refreshing_without_select(connection):
     connection.s.cache.set_last_sync("9", 100)
     asyncio.run(connection.s.sync_folder_quietly("9"))
     connection.s.syncer.incremental_sync.assert_awaited_once_with("9", window=connection.s.config.sync_window)
+
+
+def test_fairemail_date_search_includes_recent_arrival(connection):
+    from datetime import datetime, timezone
+    select(connection)
+    for mid, day in [("100", 1), ("200", 6), ("300", 13)]:
+        when = int(datetime(2026, 10, day, tzinfo=timezone.utc).timestamp())
+        connection.s.cache.add_message("0", mid, when, 1, set(), {})
+    connection._rebuild_snapshot()
+    dispatch(connection, b"SEARCH SINCE 5-Oct-2026")
+    assert b"* SEARCH 2 3\r\n" in connection.writer.data
+    assert b"A1 OK SEARCH completed" in connection.writer.data
+
+
+def test_search_notices_mail_arriving_after_select_without_idle_or_noop(connection):
+    select(connection, [set()])
+    connection.s.cache.add_message("0", "200", 2, 1, set(), {})
+    dispatch(connection, b"UID SEARCH ALL")
+    assert connection.snapshot == [1, 2]
+    assert b"* 2 EXISTS\r\n" in connection.writer.data
+    assert b"* SEARCH 1 2\r\n" in connection.writer.data
+
+
+def test_manual_search_polls_remote_before_returning_uids(connection):
+    select(connection, [set()])
+    async def incoming(fid, window):
+        connection.s.cache.add_message(fid, "200", 2, 1, set(), {})
+        return 1, []
+    connection.s.syncer.incremental_sync.side_effect = incoming
+    dispatch(connection, b"UID SEARCH UID 2:*")
+    connection.s.syncer.incremental_sync.assert_awaited_once()
+    assert b"* SEARCH 2\r\n" in connection.writer.data
+
+
+def test_fetch_can_read_an_arrival_already_added_by_background_poll(connection):
+    select(connection, [set()])
+    connection.s.cache.add_message("0", "200", 2, 1, set(), {})
+    dispatch(connection, b"UID FETCH 2 (UID FLAGS)")
+    assert b"* 2 EXISTS\r\n" in connection.writer.data
+    assert b"* 2 FETCH (UID 2 FLAGS ())\r\n" in connection.writer.data
+
+
+def test_search_defers_expunge_and_preserves_sequence_numbers(connection):
+    select(connection, [set(), set(), set()])
+    connection.s.cache.forget("0", [1])
+    connection.s.cache.add_message("0", "400", 4, 1, set(), {})
+    dispatch(connection, b"SEARCH ALL")
+    assert b"EXPUNGE" not in connection.writer.data
+    assert b"* SEARCH 2 3 4\r\n" in connection.writer.data
+    assert connection.snapshot == [1, 2, 3, 4]
+    connection.writer.data.clear()
+    dispatch(connection, b"NOOP")
+    assert b"* 1 EXPUNGE\r\n" in connection.writer.data
+    assert connection.snapshot == [2, 3, 4]
+
+
+def test_fairemail_refresh_sequence_over_local_socket(connection):
+    import imaplib
+    from datetime import datetime, timezone
+    select(connection)
+    old = int(datetime(2026, 9, 1, tzinfo=timezone.utc).timestamp())
+    new = int(datetime(2026, 10, 13, tzinfo=timezone.utc).timestamp())
+    connection.s.cache.add_message("0", "100", old, 1, {"\\Seen"}, {})
+    connection.s.config.check_login = lambda user, password: True
+    calls = 0
+    async def incoming(fid, window):
+        nonlocal calls
+        calls += 1
+        if calls == 2:  # first sync is SELECT; the second is the client's refresh SEARCH
+            connection.s.cache.add_message(fid, "200", new, 1, set(), {})
+            return 1, []
+        return 0, []
+    connection.s.syncer.incremental_sync.side_effect = incoming
+
+    def client(port):
+        with imaplib.IMAP4("127.0.0.1", port) as imap:
+            imap.login("user@example.com", "test-password")
+            assert imap.select("INBOX")[1] == [b"1"]
+            assert imap.search(None, "SINCE", "5-Oct-2026")[1] == [b"2"]
+            assert imap.fetch("2", "(UID FLAGS)")[1] == [b"2 (UID 2 FLAGS ())"]
+
+    async def run():
+        listener = await asyncio.start_server(connection.s._handle, "127.0.0.1", 0)
+        async with listener:
+            await asyncio.wait_for(asyncio.to_thread(client, listener.sockets[0].getsockname()[1]), 10)
+    asyncio.run(run())

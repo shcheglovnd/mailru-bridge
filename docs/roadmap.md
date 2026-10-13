@@ -51,8 +51,11 @@
 - [x] Web read-state sync across cached history: authoritative zero-unread reconciliation, broader
       scans on changed unread counts, periodic flag refresh, and background polling of all cached
       folders. Older flag updates are included in selected clients' IMAP notifications.
-- [ ] Richer SEARCH (header/body/date predicates) — flags, sequence/UID sets and boolean combinations
-      work; unsupported keys are rejected explicitly.
+- [x] FairEmail refresh compatibility: received-date `BEFORE`/`ON`/`SINCE` searches, fresh arrivals
+      published during SEARCH/FETCH, and immediate polling for manual SEARCH. Regression tests
+      replay selecting a folder, a subsequent arrival, date SEARCH and FETCH over local sockets.
+- [ ] Richer SEARCH (header/body text and sent-date predicates) — flags, received dates,
+      sequence/UID sets and boolean combinations work; unsupported keys are rejected explicitly.
 - [ ] Packaging and client setup docs for Thunderbird / FairEmail.
 
 ### Resolved questions
