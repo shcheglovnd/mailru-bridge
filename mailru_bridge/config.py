@@ -50,6 +50,9 @@ class BridgeConfig:
     poll_seconds: int = 180
     initial_depth: int = 2000  # newest messages to sync per folder on first run
     sync_window: int = 200  # newest messages re-checked each incremental poll
+    # Shell command run (message appended as one argument) when the bridge cannot authenticate and a
+    # `mailru-bridge login` is needed. Kept out of the code so the host owns any notifier secrets.
+    alert_command: str = ""
 
     @staticmethod
     def path() -> Path:

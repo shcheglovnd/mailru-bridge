@@ -26,3 +26,16 @@
 4. **Client settings.** IMAP on your chosen port (SSL/TLS), SMTP likewise; username is your
    mailbox address, password is the bridge password from step 1. Let the **server** manage
    the Sent and Drafts folders (the API files sent mail itself).
+
+## Alert on auth failure (optional)
+
+The bridge lives on the saved refresh token; if Mail.ru ever revokes it, syncing stops until you
+re-run `mailru-bridge login`. Point `alert_command` at a notifier and the bridge will ping you
+(at most hourly) when that happens:
+
+```sh
+mailru-bridge setup --alert-command /path/to/notify   # pass '' to disable
+```
+
+The command is run with the alert message as its final argument. Keep any notifier secrets (a bot
+token, a webhook URL) inside that script or its own config, never in this repo.

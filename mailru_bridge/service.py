@@ -104,11 +104,38 @@ class BridgeService:
     def __init__(self, account: Account, config: BridgeConfig, cache: Cache | None = None):
         self.account = account
         self.config = config
-        self.api = MailruApi(account, limiter=RateLimiter())
+        self.api = MailruApi(account, limiter=RateLimiter(), on_auth_expired=self._on_auth_expired)
         self.cache = cache or Cache()
+        self._last_alert = 0.0
         self.syncer = Syncer(self.api, self.cache)
         self.imap = ImapServer(account, self.api, self.cache, self.syncer, config)
         self.smtp = SmtpServer(account, self.api, config, self._send_message)
+
+    async def _on_auth_expired(self, reason: str) -> None:
+        """Alert the user (at most hourly) that the bridge needs a fresh `mailru-bridge login`."""
+        import time
+
+        now = time.monotonic()
+        if now - self._last_alert < 3600:
+            return
+        self._last_alert = now
+        log.error("authentication expired: %s", reason)
+        cmd = self.config.alert_command
+        if not cmd:
+            return
+        message = (
+            "⚠️ mailru-bridge can't authenticate to Mail.ru and mail has stopped syncing.\n"
+            f"Reason: {reason}\n"
+            "Fix: run `mailru-bridge login` on the host."
+        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd.split(), message,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+        except Exception:  # noqa: BLE001 — a failed alert must not crash the bridge
+            log.exception("alert command failed")
 
     async def _send_message(self, raw: bytes, mail_from: str, rcpts: list[str]) -> None:
         msg = build_outgoing(raw, mail_from, rcpts, self.account.email)

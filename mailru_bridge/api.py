@@ -221,12 +221,26 @@ class MailruApi:
         client: httpx.AsyncClient | None = None,
         limiter: RateLimiter | None = None,
         host: str = API_HOST,
+        on_auth_expired=None,
     ):
         self.account = account
         self.client = client or make_async_client()
         self.limiter = limiter or RateLimiter()
         self.host = host
+        # Called (fire-and-forget) with a reason string when the session is dead and a re-login is
+        # needed. The service uses it to alert the user; the API stays unaware of how.
+        self.on_auth_expired = on_auth_expired
         self._refresh_lock = asyncio.Lock()
+
+    def _auth_expired(self, reason: str) -> AuthExpired:
+        if self.on_auth_expired is not None:
+            try:
+                res = self.on_auth_expired(reason)
+                if asyncio.iscoroutine(res):
+                    asyncio.get_running_loop().create_task(res)
+            except Exception:  # noqa: BLE001 — alerting must never mask the real error
+                log.debug("on_auth_expired callback failed", exc_info=True)
+        return AuthExpired(reason)
 
     async def aclose(self) -> None:
         await self.client.aclose()
@@ -245,7 +259,7 @@ class MailruApi:
             if self.account.access_token_valid and self.account.access_token != stale:
                 return self.account.access_token
             if not self.account.refresh_token:
-                raise AuthExpired("No refresh token; run `mailru-bridge login`.")
+                raise self._auth_expired("No refresh token; run `mailru-bridge login`.")
             url = httpx.URL(
                 f"https://{OAUTH_HOST}/token",
                 params=signed_query(self.account.device.platform_params()),
@@ -266,10 +280,8 @@ class MailruApi:
                 body = {}
             container = Authenticator._token_container(body if isinstance(body, dict) else {})
             if resp.status_code != 200 or container is None:
-                raise AuthExpired(
-                    f"Token refresh failed (HTTP {resp.status_code}); run `mailru-bridge login`.",
-                    resp.status_code,
-                    body,
+                raise self._auth_expired(
+                    f"Token refresh failed (HTTP {resp.status_code}); run `mailru-bridge login`."
                 )
             from .auth import Tokens
 
@@ -369,7 +381,7 @@ class MailruApi:
                 return envelope
             if status == 403 and body == "user":
                 if refreshed:
-                    raise AuthExpired(f"{path}: session rejected after refresh", status, body)
+                    raise self._auth_expired(f"{path}: session rejected after refresh")
                 refreshed = True
                 await self.refresh_token(stale=token)
                 continue

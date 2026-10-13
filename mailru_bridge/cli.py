@@ -122,6 +122,8 @@ def _setup(args: argparse.Namespace) -> int:
         cfg.initial_depth = args.initial_depth
     if args.sync_window:
         cfg.sync_window = args.sync_window
+    if args.alert_command is not None:
+        cfg.alert_command = args.alert_command
     if not cfg.password_hash or args.password:
         pw = getpass.getpass("Password for mail clients to use with the bridge: ")
         again = getpass.getpass("Repeat: ")
@@ -193,6 +195,9 @@ def main(argv: list[str] | None = None) -> int:
                          help="newest messages to sync per folder on first open (default 2000)")
     p_setup.add_argument("--sync-window", type=int,
                          help="newest messages re-checked each incremental poll (default 200)")
+    p_setup.add_argument("--alert-command",
+                         help="command run (message appended) when a re-login is needed; "
+                              "pass '' to disable")
     p_setup.set_defaults(func=_setup)
 
     p_serve = sub.add_parser("serve", help="run the IMAP/SMTP bridge")
