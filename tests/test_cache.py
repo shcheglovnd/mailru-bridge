@@ -51,3 +51,44 @@ def test_live_ids(tmp_path):
     c.add_message("5", "a", 1, 0, set(), {})
     c.add_message("5", "b", 2, 0, set(), {})
     assert c.live_mailru_ids("5") == {"a", "b"}
+
+
+def test_move_over_existing_destination_refreshes_source_and_keeps_destination_uid(tmp_path):
+    c = _cache(tmp_path)
+    try:
+        for fid in ("0", "1"):
+            c.upsert_folder(fid, fid, "-1", "user", False, 0, 0)
+        src = c.add_message("0", "100", 20, 1, {"\\Seen", "\\Deleted"}, {"subject": "current"})
+        dst = c.add_message("1", "100", 10, 1, set(), {"subject": "stale"})
+        raw = b"Subject: current\r\n\r\nbody"
+        c.set_raw("0", src, raw)
+        assert c.move_messages("0", "1", [src]) == {src: dst}
+        assert c.get_raw("1", dst) == raw
+        assert c.message_by_uid("1", dst).flags == {"\\Seen"}
+        assert c.message_by_uid("1", dst).meta["subject"] == "current"
+        assert c.messages("0") == []
+    finally:
+        c.close()
+
+
+def test_multi_message_move_rolls_back_on_destination_uid_conflict(tmp_path):
+    import sqlite3
+    import pytest
+    c = _cache(tmp_path)
+    try:
+        for fid in ("0", "1"):
+            c.upsert_folder(fid, fid, "-1", "user", False, 0, 0)
+        first = c.add_message("0", "100", 1, 1, set(), {})
+        second = c.add_message("0", "200", 2, 1, set(), {})
+        c.add_message("1", "300", 3, 1, set(), {})
+        c.add_message("1", "400", 4, 1, set(), {})
+        c.forget("1", [1])
+        # Simulate corrupted bookkeeping: first insert succeeds but second would collide.
+        c._conn.execute("UPDATE folders SET uidnext=1 WHERE id='1'")
+        c._conn.commit()
+        with pytest.raises(sqlite3.IntegrityError):
+            c.move_messages("0", "1", [first, second])
+        assert c.live_mailru_ids("0") == {"100", "200"}
+        assert c.live_mailru_ids("1") == {"400"}
+    finally:
+        c.close()

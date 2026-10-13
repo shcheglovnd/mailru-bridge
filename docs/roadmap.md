@@ -54,8 +54,12 @@
 - [x] FairEmail refresh compatibility: received-date `BEFORE`/`ON`/`SINCE` searches, fresh arrivals
       published during SEARCH/FETCH, and immediate polling for manual SEARCH. Regression tests
       replay selecting a folder, a subsequent arrival, date SEARCH and FETCH over local sockets.
-- [ ] Richer SEARCH (header/body text and sent-date predicates) — flags, received dates,
-      sequence/UID sets and boolean combinations work; unsupported keys are rejected explicitly.
+- [x] Richer SEARCH: sent dates, sender/recipient/subject/custom headers, decoded body/text and sizes;
+      grouped literal arguments, charset errors and lazy source access with cheap filters first.
+- [x] Further client compatibility fixes: SASL initial responses, correct subscription listings,
+      mailbox case/hierarchy handling, deselection after failed SELECT, immediate destination-cache
+      moves, edited-draft invalidation, cached header metadata, missing-message tolerance, MIME section
+      NIL responses and RFC 2231 attachment filenames. Mail API list metadata requests plain text.
 - [ ] Packaging and client setup docs for Thunderbird / FairEmail.
 
 ### Resolved questions

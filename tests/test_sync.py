@@ -175,3 +175,59 @@ def test_unstable_history_scan_keeps_pending_flag_refresh(syncer):
     syncer.api.messages.side_effect = [page([30, 20], 3), page([10], 4)]
     asyncio.run(syncer.incremental_sync("0", window=2, page=2))
     assert syncer.cache.get_meta("flags_dirty:0") == "1"
+
+
+def test_incremental_refreshes_existing_summary_without_replacing_uid_or_source(syncer):
+    uid = syncer.cache.add_message("0", "10", 10, 1, {"\\Deleted"}, {"subject": "old"})
+    raw = b"Subject: original\r\nMessage-ID: <original@example.com>\r\n\r\nbody"
+    syncer.cache.set_raw("0", uid, raw)
+    result = page([10])
+    result.messages[0].subject = "updated list metadata"
+    result.messages[0].size = 5
+    syncer.api.messages.return_value = result
+    asyncio.run(syncer.incremental_sync("0"))
+    msg = syncer.cache.message_by_uid("0", uid)
+    assert msg.meta["subject"] == "updated list metadata"
+    assert msg.meta["headers"]["message-id"] == ["<original@example.com>"]
+    assert msg.size == len(raw)
+    assert syncer.cache.get_raw("0", uid) == raw
+    assert "\\Deleted" in msg.flags
+
+
+def test_web_draft_edits_invalidate_cached_body_even_with_same_id_and_size(syncer):
+    syncer.cache.upsert_folder("500001", "Drafts", "-1", "drafts", True, 1, 0)
+    uid = syncer.cache.add_message("500001", "10", 10, 20, set(), {"subject": "old"})
+    old = b"Subject: old\r\n\r\nold body"
+    new = b"Subject: new\r\n\r\nnew body"
+    syncer.cache.set_raw("500001", uid, old)
+    message = RemoteMessage("10", "500001", 10, size=len(new), subject="new")
+    syncer.api.messages.return_value = MessagePage([message], 1, 0)
+    syncer.api.download.return_value = new
+    async def run():
+        await syncer.incremental_sync("500001")
+        assert syncer.cache.get_raw("500001", uid) is None
+        assert await syncer.ensure_raw("500001", uid) == new
+    asyncio.run(run())
+    msg = syncer.cache.message_by_uid("500001", uid)
+    assert msg.meta["subject"] == "new"
+    assert "\\Draft" in msg.flags
+    assert syncer.cache.uid_for("500001", "10") == uid
+
+
+def test_remote_deletion_count_triggers_history_reconciliation_even_when_all_read(syncer):
+    syncer.cache.upsert_folder("0", "INBOX", "-1", "inbox", True, 3, 0)
+    syncer.api.folders.return_value = [RemoteFolder("0", "INBOX", total=2, unread=0)]
+    asyncio.run(syncer.sync_folders())
+    assert syncer.cache.get_meta("flags_dirty:0") == "1"
+    asyncio.run(syncer.sync_folders())
+    assert syncer.cache.get_meta("flags_dirty:0") == "1"  # survives a failed/interrupted scan
+
+
+def test_missing_raw_source_forgets_only_that_cached_message(syncer):
+    from mailru_bridge.api import NotFound
+    uid = syncer.cache.add_message("0", "10", 10, 1, set(), {})
+    syncer.api.download.side_effect = NotFound("removed", 404)
+    with pytest.raises(NotFound):
+        asyncio.run(syncer.ensure_raw("0", uid))
+    assert syncer.cache.message_by_uid("0", uid) is None
+    assert syncer.cache.folder("0")["uidnext"] == 2

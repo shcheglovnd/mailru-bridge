@@ -106,3 +106,15 @@ def test_rate_limit_penalty_delays_the_next_request():
     before = time.monotonic()
     limiter.penalize(30)
     assert limiter._next >= before + 30
+
+
+def test_listing_requests_plain_metadata_without_html_entities(account):
+    def handle(request):
+        assert request.url.params["htmlencoded"] == "false"
+        if request.url.path.endswith("folders"):
+            return httpx.Response(200, json={"status": 200, "htmlencoded": False,
+                                           "body": [{"id": "0", "name": "A & B"}]})
+        return httpx.Response(200, json={"status": 200, "htmlencoded": False, "body": {
+            "messages_total": 1, "messages": [{"id": "100", "subject": "A & B"}]}})
+    assert run_api(account, handle, lambda api: api.folders())[0].name == "A & B"
+    assert run_api(account, handle, lambda api: api.messages("0")).messages[0].subject == "A & B"

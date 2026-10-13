@@ -22,14 +22,14 @@ import ssl
 import time
 from email.utils import formatdate
 
-from .api import ApiError, AuthExpired, MailruApi
+from .api import ApiError, AuthExpired, MailruApi, NotFound
 from .cache import Cache, CachedMessage
 from .config import BridgeConfig
 from .imap_struct import bodystructure, envelope, envelope_from_meta
 from .imap_utf7 import decode as u7decode, encode as u7encode
 from .mime import Message as MimeMessage
 from .outgoing import build_draft
-from .search import compile_search
+from .search import UnsupportedCharset, compile_search
 from .sync import Syncer
 
 log = logging.getLogger(__name__)
@@ -62,7 +62,7 @@ class MailboxTree:
         names: dict[str, str] = {}
         paths: dict[str, str] = {}
         for r in rows:
-            names[r["id"]] = r["name"]
+            names[r["id"]] = SPECIAL.get(r["id"], (r["name"], ""))[0]
         for r in rows:
             fid = r["id"]
             if fid in SPECIAL:
@@ -80,12 +80,12 @@ class MailboxTree:
                 path = "/".join(reversed(parts))
             paths[fid] = path
         self.by_id = paths
-        self.by_name = {v.lower(): k for k, v in paths.items()}
+        self.by_name = {v: k for k, v in paths.items()}
 
     def id_for(self, name: str) -> str | None:
         if name.upper() == "INBOX":
-            return "0"
-        return self.by_name.get(name.lower())
+            return "0" if "0" in self.by_id else None
+        return self.by_name.get(name)
 
     def name_for(self, fid: str) -> str:
         return self.by_id.get(fid, fid)
@@ -184,8 +184,7 @@ class ImapConnection:
             tokens.append(("l", chunk))
             nxt = await self.read_line()
             if nxt is None:
-                tokens.append(("t", b""))
-                break
+                return None  # a literal without the command's terminating line is incomplete
             buf = nxt
             size += len(nxt)
         return tokens
@@ -353,12 +352,24 @@ class ImapConnection:
         # Minimal AUTH=PLAIN support (some clients prefer it).
         import base64
 
-        mech = rest.split(b" ", 1)[0].upper()
+        parts = rest.split()
+        mech = parts[0].upper() if parts else b""
         if mech != b"PLAIN":
             await self.tagged(tag, "NO", "only AUTH=PLAIN supported")
             return True
-        await self.send(b"+ ")
-        line = await self.read_line()
+        if len(parts) > 2:
+            await self.tagged(tag, "BAD", "AUTHENTICATE syntax")
+            return True
+        if len(parts) == 2:
+            line = parts[1]
+        else:
+            await self.send(b"+ ")
+            line = await self.read_line()
+        if line is None:
+            return False
+        if line == b"*":
+            await self.tagged(tag, "BAD", "AUTHENTICATE cancelled")
+            return True
         try:
             decoded = base64.b64decode(line, validate=True).split(b"\x00")
             if len(decoded) != 3 or (decoded[0] and decoded[0] != decoded[1]):
@@ -381,39 +392,53 @@ class ImapConnection:
     # -- mailboxes -------------------------------------------------------------------------
 
     async def cmd_list(self, tag, rest, tokens) -> bool:
+        return await self._list(tag, tokens, subscribed=False)
+
+    async def _list(self, tag, tokens, subscribed: bool) -> bool:
         if not self.authed:
             await self.tagged(tag, "NO", "LOGIN first")
             return True
         await self.s.refresh_tree()
+        command = b"LSUB" if subscribed else b"LIST"
         args = _split_astrings(tokens)
         reference = _mailbox_name(args[0]) if args else ""
         pattern = _mailbox_name(args[1]) if len(args) > 1 else "*"
         if not pattern:
-            await self.untagged(b'LIST (\\Noselect) "/" ""')
-            await self.tagged(tag, "OK", "LIST completed")
+            await self.untagged(command + b' (\\Noselect) "/" ""')
+            await self.tagged(tag, "OK", command.decode() + " completed")
             return True
         pattern = reference + pattern
         regex = _wildcard_to_regex(pattern)
         for fid, path in sorted(self.s.tree.by_id.items(), key=lambda kv: kv[1]):
-            if regex.match(path) or (path.upper() == "INBOX" and regex.match("INBOX")):
+            if subscribed and self.s.cache.get_meta(f"subscribed:{fid}", "1") != "1":
+                continue
+            if regex.match(path) or (path == "INBOX" and _wildcard_to_regex(pattern.upper()).match("INBOX")):
                 flags = ["\\HasNoChildren"]
                 if fid in self.s.tree.special:
                     flags.append(self.s.tree.special[fid])
                 if self.s.has_children(fid):
                     flags = [f for f in flags if f != "\\HasNoChildren"] + ["\\HasChildren"]
-                await self.untagged(b'LIST (' + " ".join(flags).encode() + b') "/" ' + _wire_name(path))
-        await self.tagged(tag, "OK", "LIST completed")
+                await self.untagged(command + b' (' + " ".join(flags).encode() + b') "/" ' + _wire_name(path))
+        await self.tagged(tag, "OK", command.decode() + " completed")
         return True
 
     async def cmd_lsub(self, tag, rest, tokens) -> bool:
-        return await self.cmd_list(tag, rest, tokens)
+        return await self._list(tag, tokens, subscribed=True)
 
     async def cmd_subscribe(self, tag, rest, tokens) -> bool:
-        await self.tagged(tag, "OK", "SUBSCRIBE completed")
-        return True
+        return await self._subscribe(tag, tokens, True)
 
     async def cmd_unsubscribe(self, tag, rest, tokens) -> bool:
-        await self.tagged(tag, "OK", "UNSUBSCRIBE completed")
+        return await self._subscribe(tag, tokens, False)
+
+    async def _subscribe(self, tag, tokens, subscribed: bool) -> bool:
+        args = _split_astrings(tokens)
+        fid = self.s.tree.id_for(_mailbox_name(args[0]))
+        if fid is None:
+            await self.tagged(tag, "NO", "no such mailbox")
+            return True
+        self.s.cache.set_meta(f"subscribed:{fid}", "1" if subscribed else "0")
+        await self.tagged(tag, "OK", ("SUBSCRIBE" if subscribed else "UNSUBSCRIBE") + " completed")
         return True
 
     async def cmd_status(self, tag, rest, tokens) -> bool:
@@ -446,6 +471,7 @@ class ImapConnection:
         if not self.authed:
             await self.tagged(tag, "NO", "LOGIN first")
             return True
+        self._deselect()
         args = _split_astrings(tokens)
         name = _mailbox_name(args[0])
         fid = self.s.tree.id_for(name)
@@ -481,16 +507,20 @@ class ImapConnection:
     async def cmd_close(self, tag, rest, tokens) -> bool:
         if self.selected and not self.readonly:
             await self._expunge(silent=True)
-        self.selected = None
-        self.snapshot = []
+        self._deselect()
         await self.tagged(tag, "OK", "CLOSE completed")
         return True
 
     async def cmd_unselect(self, tag, rest, tokens) -> bool:
-        self.selected = None
-        self.snapshot = []
+        self._deselect()
         await self.tagged(tag, "OK", "UNSELECT completed")
         return True
+
+    def _deselect(self) -> None:
+        self.selected = None
+        self.readonly = False
+        self.snapshot = []
+        self.snapshot_flags = {}
 
     async def cmd_create(self, tag, rest, tokens) -> bool:
         args = _split_astrings(tokens)
@@ -499,7 +529,13 @@ class ImapConnection:
         name = path
         if "/" in path:
             parent_path, name = path.rsplit("/", 1)
-            parent_id = self.s.tree.id_for(parent_path) or "-1"
+            parent_id = self.s.tree.id_for(parent_path)
+            if parent_id is None:
+                await self.tagged(tag, "NO", "parent mailbox does not exist")
+                return True
+        if not name:
+            await self.tagged(tag, "BAD", "mailbox name is empty")
+            return True
         try:
             await self.s.api.create_folder(name, parent_id)
         except ApiError as exc:
@@ -531,9 +567,21 @@ class ImapConnection:
             await self.tagged(tag, "NO", "no such mailbox")
             return True
         newpath = u7decode(_astr(args[1]).encode("latin-1"))
+        if fid in SPECIAL:
+            await self.tagged(tag, "NO", "system mailbox cannot be renamed")
+            return True
         name = newpath.rsplit("/", 1)[-1]
+        parent = "-1"
+        if "/" in newpath:
+            parent = self.s.tree.id_for(newpath.rsplit("/", 1)[0])
+            if parent is None:
+                await self.tagged(tag, "NO", "parent mailbox does not exist")
+                return True
+        if not name or parent == fid:
+            await self.tagged(tag, "NO", "invalid mailbox hierarchy")
+            return True
         try:
-            await self.s.api.rename_folder(fid, name)
+            await self.s.api.rename_folder(fid, name, parent=parent)
         except ApiError as exc:
             await self.tagged(tag, "NO", f"RENAME failed: {exc}")
             return True
@@ -658,7 +706,10 @@ class ImapConnection:
         mime: MimeMessage | None = None
         mark_seen = False
         if need_raw:
-            raw = await self.s.syncer.ensure_raw(self.selected, uid)
+            try:
+                raw = await self.s.syncer.ensure_raw(self.selected, uid)
+            except NotFound:
+                return None
             mime = MimeMessage(raw)
             cm = self.s.cache.message_by_uid(self.selected, uid)  # size may have been corrected
 
@@ -712,9 +763,9 @@ class ImapConnection:
         start = m.group(3)
         length = m.group(4)
         data = mime.section_bytes(section)
-        if data is None:
-            data = b""
         label = f"BODY[{section}]"
+        if data is None:
+            return label.encode() + b" NIL", False
         if start is not None:
             s = int(start)
             data = data[s:] if length is None else data[s : s + int(length)]
@@ -768,6 +819,9 @@ class ImapConnection:
         if dest is None:
             await self.tagged(tag, "NO", "no such destination mailbox")
             return True
+        if dest == self.selected:
+            await self.tagged(tag, "NO", "source and destination mailbox are the same")
+            return True
         ranges = self._ranges(_astr(args[0]), by_uid)
         targets = self._resolve(ranges, by_uid)
         ids = [self.s.cache.message_by_uid(self.selected, uid).mailru_id for _, uid in targets
@@ -776,7 +830,7 @@ class ImapConnection:
             uids = [uid for _, uid in targets]
             async with self.s._lock:
                 await self.s.api.move(ids, dest)
-                self.s.cache.forget(self.selected, uids)
+                self.s.cache.move_messages(self.selected, dest, uids)
             exp_set = set(uids)
             for seq in range(len(self.snapshot), 0, -1):
                 if self.snapshot[seq - 1] in exp_set:
@@ -812,6 +866,7 @@ class ImapConnection:
                 await self.s.api.remove(ids)
             else:
                 await self.s.api.move(ids, "500002")
+                self.s.cache.move_messages(self.selected, "500002", [uid for _, uid in to_delete])
         for seq, uid in sorted(to_delete, reverse=True):
             self.s.cache.forget(self.selected, [uid])
             idx = self.snapshot.index(uid)
@@ -832,6 +887,9 @@ class ImapConnection:
         try:
             args = _split_astrings(tokens)
             compile_search(args, _split_astrings, self._ranges)
+        except UnsupportedCharset:
+            await self.tagged(tag, "NO", "[BADCHARSET (US-ASCII UTF-8)] unsupported charset")
+            return True
         except ValueError as exc:
             log.warning("IMAP SEARCH rejected (folder %s)", self.selected)
             await self.tagged(tag, "BAD", str(exc))
@@ -844,7 +902,17 @@ class ImapConnection:
         results = []
         for seq, uid in enumerate(self.snapshot, 1):
             cm = self.s.cache.message_by_uid(self.selected, uid)
-            if cm is not None and predicate(cm, seq):
+            if cm is None:
+                continue
+            try:
+                matched = await predicate(cm, seq, lambda uid=uid: self.s.syncer.ensure_raw(self.selected, uid))
+            except NotFound:
+                continue  # one externally removed message must not fail the whole search
+            except KeyError:
+                if self.s.cache.message_by_uid(self.selected, uid) is None:
+                    continue
+                raise
+            if matched:
                 results.append(seq)
         if by_uid:
             values = [self.snapshot[seq - 1] for seq in results]
@@ -953,65 +1021,64 @@ def _mailbox_name(value) -> str:
 
 
 def _split_astrings(tokens: list[tuple[str, bytes]]) -> list:
-    """Split a token list into IMAP astrings, with literals passed through as ``bytes``.
+    """Parse astrings and nested groups across text/literal boundaries.
 
-    ``tokens`` is the ``[("t", text), ("l", octets), ...]`` form from :meth:`read_command` (after
-    the tag/command have been stripped). Quoted strings and atoms come back as ``str``; literal
-    blocks come back as ``bytes``; parenthesised groups come back verbatim as ``bytes``.
+    Groups are lists, literals stay bytes, and ordinary strings are decoded as UTF-8. Keeping
+    literals opaque prevents their contents from being mistaken for command/group syntax.
     """
-    out: list = []
+    root: list = []
+    stack = [root]
+    atom = bytearray()
+    quoted: bytearray | None = None
+    escaped = False
+
+    def flush() -> None:
+        if atom:
+            stack[-1].append(bytes(atom).decode("utf-8", "replace"))
+            atom.clear()
+
     for kind, data in tokens:
         if kind == "l":
-            out.append(data)
+            if quoted is not None:
+                raise ValueError("literal inside quoted string")
+            flush()
+            stack[-1].append(data)
             continue
-        rest = data
-        i = 0
-        n = len(rest)
-        while i < n:
-            c = rest[i : i + 1]
-            if c in (b" ", b"\t"):
-                i += 1
-                continue
-            if c == b'"':
-                j = i + 1
-                buf = bytearray()
-                while j < n and rest[j : j + 1] != b'"':
-                    if rest[j : j + 1] == b"\\":
-                        j += 1
-                    buf += rest[j : j + 1]
-                    j += 1
-                out.append(bytes(buf).decode("utf-8", "replace"))
-                if j >= n:
-                    raise ValueError("unterminated quoted string")
-                i = j + 1
-            elif c == b"(":
-                depth = 1
-                j = i + 1
-                quoted = False
-                while j < n and depth:
-                    if rest[j : j + 1] == b"\\" and quoted:
-                        j += 2
-                        continue
-                    if rest[j : j + 1] == b'"':
-                        quoted = not quoted
-                    elif rest[j : j + 1] == b"(" and not quoted:
-                        depth += 1
-                    elif rest[j : j + 1] == b")" and not quoted:
-                        depth -= 1
-                    j += 1
-                if depth:
-                    raise ValueError("unterminated parenthesised group")
-                out.append(rest[i:j])
-                i = j
-            else:
-                j = i
-                while j < n and rest[j : j + 1] not in (b" ", b"\t", b"(", b")"):
-                    j += 1
-                if j == i:
+        for ch in data:
+            if quoted is not None:
+                if escaped:
+                    quoted.append(ch)
+                    escaped = False
+                elif ch == 92:
+                    escaped = True
+                elif ch == 34:
+                    stack[-1].append(bytes(quoted).decode("utf-8", "replace"))
+                    quoted = None
+                else:
+                    quoted.append(ch)
+            elif ch in (32, 9):
+                flush()
+            elif ch == 34:
+                flush()
+                quoted = bytearray()
+            elif ch == 40:
+                flush()
+                group: list = []
+                stack[-1].append(group)
+                stack.append(group)
+            elif ch == 41:
+                flush()
+                if len(stack) == 1:
                     raise ValueError("unexpected closing parenthesis")
-                out.append(rest[i:j].decode("utf-8", "replace"))
-                i = j
-    return out
+                stack.pop()
+            else:
+                atom.append(ch)
+    if quoted is not None:
+        raise ValueError("unterminated quoted string")
+    if len(stack) != 1:
+        raise ValueError("unterminated parenthesised group")
+    flush()
+    return root
 
 
 def _parse_fetch_items(spec: str) -> list[str]:
@@ -1025,6 +1092,8 @@ def _parse_fetch_items(spec: str) -> list[str]:
         return macros[spec.upper()]
     if spec.startswith("(") and spec.endswith(")"):
         spec = spec[1:-1]
+    if spec.upper() in macros:
+        return macros[spec.upper()]
     items: list[str] = []
     i = 0
     n = len(spec)
@@ -1047,7 +1116,29 @@ def _parse_fetch_items(spec: str) -> list[str]:
                 j = k + 1
         items.append(spec[i:j])
         i = j
+    simple = {"UID", "FLAGS", "INTERNALDATE", "RFC822.SIZE", "ENVELOPE", "BODY", "BODYSTRUCTURE",
+              "RFC822", "RFC822.HEADER", "RFC822.TEXT"}
+    if not items:
+        raise ValueError("FETCH needs attributes")
+    for item in items:
+        if item.upper() in simple:
+            continue
+        match = re.fullmatch(r"BODY(?:\.PEEK)?\[([^\]]*)\](?:<[0-9]+\.[1-9][0-9]*>)?", item, re.IGNORECASE)
+        if not match or not _valid_body_section(match[1]):
+            raise ValueError("unsupported or invalid FETCH attribute")
     return items
+
+
+def _valid_body_section(section: str) -> bool:
+    if section.upper() in {"", "HEADER", "TEXT"}:
+        return True
+    numeric = re.fullmatch(r"[1-9][0-9]*(?:\.[1-9][0-9]*)*(?:\.(.*))?", section)
+    if numeric:
+        suffix = numeric[1]
+        if suffix is None or suffix.upper() in {"MIME", "HEADER", "TEXT"}:
+            return True
+        section = suffix
+    return bool(re.fullmatch(r"HEADER\.FIELDS(?:\.NOT)?\s+\([^()\r\n]+\)", section, re.IGNORECASE))
 
 
 def _needs_raw(item: str) -> bool:
@@ -1083,7 +1174,7 @@ def _wildcard_to_regex(pattern: str) -> re.Pattern:
         else:
             out.append(re.escape(ch))
     out.append("$")
-    return re.compile("".join(out), re.IGNORECASE)
+    return re.compile("".join(out))
 
 
 # -- server -----------------------------------------------------------------------------------
@@ -1102,7 +1193,7 @@ class ImapServer:
         self._folders_synced_at = 0.0
 
     def capabilities(self) -> str:
-        caps = ["IMAP4rev1", "AUTH=PLAIN", "IDLE", "MOVE", "LITERAL+", "NAMESPACE", "ID", "UNSELECT"]
+        caps = ["IMAP4rev1", "AUTH=PLAIN", "SASL-IR", "IDLE", "MOVE", "LITERAL+", "NAMESPACE", "ID", "UNSELECT"]
         return " ".join(caps)
 
     def has_children(self, fid: str) -> bool:

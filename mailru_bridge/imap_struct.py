@@ -8,8 +8,9 @@ parenthesised list of quoted strings, ``NIL``, and numbers (RFC 3501 ยง7.4.2 / ย
 from __future__ import annotations
 
 from email.utils import formatdate, getaddresses, parsedate_to_datetime
+from email.header import Header
 
-from .mime import CRLF, Message, Part, body_lines, decode_text, field_value
+from .mime import CRLF, HeaderField, Message, Part, body_lines, decode_text, field_value
 
 
 def quote(value) -> bytes:
@@ -18,7 +19,7 @@ def quote(value) -> bytes:
         return b"NIL"
     if isinstance(value, str):
         value = value.encode("utf-8")
-    if b"\r" in value or b"\n" in value:
+    if b"\r" in value or b"\n" in value or any(ch == 0 or ch >= 128 for ch in value):
         return b"{%d}\r\n%s" % (len(value), value)
     escaped = value.replace(b"\\", b"\\\\").replace(b'"', b'\\"')
     return b'"' + escaped + b'"'
@@ -40,17 +41,32 @@ def _addr_list(raw: bytes | None) -> bytes:
     for display, addr in getaddresses([text]):
         if not display and not addr:
             continue
-        name = quote(decode_text(display.encode("utf-8")) if display else None)
+        name = quote(_encoded_header(display) if display else None)
         local, _, host = addr.partition("@")
         out.append(b"(" + name + b" NIL " + quote(local or None) + b" " + quote(host or None) + b")")
     return b"(" + b"".join(out) + b")" if out else b"NIL"
 
 
 def envelope(msg: Message) -> bytes:
-    fields = msg.root.fields
+    return _envelope_fields(msg.root.fields)
+
+
+def _encoded_header(value) -> bytes | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        if value.isascii():
+            return value
+        value = decode_text(value)
+    if value.isascii():
+        return value.encode("ascii")
+    return Header(value, "utf-8", maxlinelen=998).encode().encode("ascii")
+
+
+def _envelope_fields(fields) -> bytes:
     date = field_value(fields, "date")
     subject_raw = field_value(fields, "subject")
-    subject = quote(decode_text(subject_raw)) if subject_raw is not None else b"NIL"
+    subject = quote(_encoded_header(subject_raw))
     from_ = _addr_list(field_value(fields, "from"))
     sender = _addr_list(field_value(fields, "sender")) if field_value(fields, "sender") else from_
     reply_to = _addr_list(field_value(fields, "reply-to")) if field_value(fields, "reply-to") else from_
@@ -68,7 +84,7 @@ def _addr_pairs(pairs) -> bytes:
     out = []
     for name, addr in pairs or []:
         local, _, host = (addr or "").partition("@")
-        out.append(b"(" + quote(name or None) + b" NIL " + quote(local or None)
+        out.append(b"(" + quote(_encoded_header(name) if name else None) + b" NIL " + quote(local or None)
                    + b" " + quote(host or None) + b")")
     return b"(" + b"".join(out) + b")" if out else b"NIL"
 
@@ -79,8 +95,15 @@ def envelope_from_meta(meta: dict, date: int) -> bytes:
     Fields we do not have from the list (sender/reply-to default to From; in-reply-to and
     message-id are ``NIL``) follow the same fall-backs the spec allows.
     """
+    if "headers" in meta:
+        fields = []
+        for name, values in meta["headers"].items():
+            if values:
+                value = ", ".join(values) if name in {"from", "to", "cc", "bcc", "sender", "reply-to"} else values[0]
+                fields.append(HeaderField(name, b"", value.encode("utf-8")))
+        return _envelope_fields(fields)
     date_hdr = quote(formatdate(date, localtime=False)) if date else b"NIL"
-    subject = quote(meta.get("subject") or None)
+    subject = quote(_encoded_header(meta.get("subject")))
     from_ = _addr_pairs(meta.get("from"))
     to = _addr_pairs(meta.get("to"))
     cc = _addr_pairs(meta.get("cc"))

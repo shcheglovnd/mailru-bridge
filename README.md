@@ -87,11 +87,18 @@ updates all cached messages in that folder on the next poll, so web "mark all as
 mail too. Older message flags are also rechecked periodically (default 15 minutes, configurable with
 `setup --flag-refresh <seconds>`); this scans message summaries down to the oldest cached message,
 without downloading bodies or resetting UIDs.
-SEARCH supports flags, internal-date `BEFORE`/`ON`/`SINCE`, sequence/UID sets, AND, OR, NOT and
-grouping. Date searches used for normal FairEmail synchronization work without downloading bodies.
+SEARCH supports flags, received/sent dates, sender/recipient/subject/custom headers, body/text,
+sizes, sequence/UID sets, AND, OR, NOT and grouping, including literal arguments inside groups.
+Date and flag searches used for normal FairEmail synchronization work without downloading bodies.
 Manual SEARCH polls for arrivals immediately and publishes messages added since the folder was
-opened; it does not wait for the background poll. Header/body text and sent-date predicates are
-still unsupported. Read-only `EXAMINE` sessions cannot modify mail.
+opened; it does not wait for the background poll. Custom-header, sent-date and body searches may
+download uncached sources; cheap date/UID/flag filters are evaluated first to limit that work.
+Read-only `EXAMINE` sessions cannot modify mail.
+
+`LSUB` and local subscriptions are supported, as is `AUTHENTICATE PLAIN` with a SASL initial
+response. Folder names preserve case; only `INBOX` is case-insensitive. Moves and deletes-to-Trash
+update the destination cache immediately and preserve downloaded sources. Draft refreshes discard
+old cached bodies so edits in the web client appear on the next fetch, without changing the UID.
 
 ## Development checks
 
@@ -103,6 +110,8 @@ python -m pytest -q
 Tests use temporary caches, mocked API requests, and local IMAP/SMTP sockets; they do not send or
 delete real mail. They cover authentication gates, UID ranges and scoped expunges, draft safety,
 multiple-client sync, SMTP transaction state, oversized DATA recovery, MIME and credential logging.
+Protocol replays also cover authentication, subscriptions, grouped literal searches, sent dates,
+incoming messages, cached moves, externally deleted messages, failed selections and draft edits.
 
 ## Privacy & safety
 

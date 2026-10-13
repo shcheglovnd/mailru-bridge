@@ -123,6 +123,7 @@ class RemoteMessage:
     sender: list[tuple[str, str]] = field(default_factory=list)
     to: list[tuple[str, str]] = field(default_factory=list)
     cc: list[tuple[str, str]] = field(default_factory=list)
+    bcc: list[tuple[str, str]] = field(default_factory=list)
     thread_id: str = ""
 
     @classmethod
@@ -143,6 +144,7 @@ class RemoteMessage:
             sender=_addresses(corr.get("from")),
             to=_addresses(corr.get("to")),
             cc=_addresses(corr.get("cc")),
+            bcc=_addresses(corr.get("bcc")),
             thread_id=str(data.get("m_thread_id") or data.get("thread_id") or ""),
         )
 
@@ -427,7 +429,7 @@ class MailruApi:
     # -- reading ---------------------------------------------------------------------------
 
     async def folders(self) -> list[RemoteFolder]:
-        body = (await self._call("api/v1/folders")).get("body")
+        body = (await self._call("api/v1/folders", [("htmlencoded", "false")])).get("body")
         if not isinstance(body, list) or any(not isinstance(f, dict) or "id" not in f for f in body):
             raise ApiError("folders: unexpected body", body=body)
         return [RemoteFolder.from_json(f) for f in body]
@@ -437,6 +439,7 @@ class MailruApi:
     ) -> MessagePage:
         """One page of a folder, newest first (``GET api/v1/messages/status``)."""
         query = [
+            ("htmlencoded", "false"),
             ("sort", SORT_NEWEST_FIRST),
             ("limit", str(limit)),
             ("folder", str(folder)),

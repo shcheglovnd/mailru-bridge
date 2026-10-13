@@ -45,3 +45,19 @@ def test_envelope_from_meta():
     assert env.count(b"(") >= 3
     assert b'"a" "example.com"' in env
     assert b'"b" "x.ru"' in env
+
+
+def test_unicode_envelope_metadata_is_encoded_for_imap_rev1():
+    env = envelope_from_meta({"subject": "Привет", "from": [("Иван", "alice@example.com")]}, 1)
+    assert env.isascii()
+    assert b"=?utf-8?" in env
+    assert quote("Привет").startswith(b"{12}\r\n")
+
+
+def test_international_attachment_parameters_retain_rfc2231_encoding():
+    raw = (b"Content-Type: application/pdf; name*=utf-8''%E2%9C%93.pdf\r\n"
+           b"Content-Disposition: attachment; filename*0*=utf-8''%E2%9C; filename*1*=%93.pdf\r\n\r\nDATA")
+    structure = bodystructure(Message(raw))
+    assert b'"name*" "utf-8\'\'%E2%9C%93.pdf"' in structure
+    assert b'"filename*0*" "utf-8\'\'%E2%9C"' in structure
+    assert b'"filename*1*" "%93.pdf"' in structure

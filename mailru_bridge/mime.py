@@ -15,9 +15,26 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from email.header import decode_header, make_header
+from email.parser import BytesHeaderParser
+from email.policy import default as default_policy
 from email.utils import getaddresses, parsedate_tz
 
 CRLF = b"\r\n"
+
+
+def decoded_headers(raw: bytes) -> dict[str, list[str]]:
+    """Small decoded header cache for SEARCH and metadata-only ENVELOPE fetches."""
+    end = raw.find(b"\r\n\r\n")
+    block = raw[:end + 4] if end >= 0 else raw
+    msg = BytesHeaderParser(policy=default_policy).parsebytes(block)
+    headers: dict[str, list[str]] = {}
+    for name, value in msg.raw_items():
+        try:
+            decoded = str(msg.policy.header_fetch_parse(name, value))
+        except Exception:  # malformed mail headers must not prevent caching the message
+            decoded = decode_text(value.encode("utf-8", "surrogateescape"))
+        headers.setdefault(name.lower(), []).append(decoded)
+    return headers
 
 
 def normalize(data: bytes) -> bytes:
@@ -104,8 +121,8 @@ _PARAM = re.compile(rb'\s*;\s*([^\s;=]+)\s*=\s*("(?:[^"\\]|\\.)*"|[^;]*)')
 def parse_params(value: bytes) -> tuple[bytes, dict[str, bytes]]:
     """Split ``type/sub; a=b; c="d"`` into the leading token and a dict of parameters.
 
-    Parameter names are lower-cased; values are unquoted. RFC 2231 continuations/charset
-    forms (``name*0``, ``name*=utf-8''…``) are joined into the base name, best-effort.
+    Parameter names are lower-cased; values are unquoted. Preserve RFC 2231 names and
+    charset information so mail clients can decode international attachment filenames.
     """
     if value is None:
         return b"", {}
@@ -118,27 +135,7 @@ def parse_params(value: bytes) -> tuple[bytes, dict[str, bytes]]:
         if raw[:1] == b'"':
             raw = raw[1:-1].replace(b'\\"', b'"').replace(b"\\\\", b"\\")
         params[name] = raw
-    # Merge RFC 2231 split parameters: foo*0, foo*1 -> foo ; foo* -> foo
-    merged: dict[str, bytes] = {}
-    continued: dict[str, list[tuple[int, bytes]]] = {}
-    for name, raw in params.items():
-        base = name
-        idx = 0
-        if "*" in name:
-            star = name.split("*")
-            base = star[0]
-            if len(star) > 1 and star[1].isdigit():
-                idx = int(star[1])
-        if "*" in name:
-            continued.setdefault(base, []).append((idx, raw))
-        else:
-            merged[name] = raw
-    for base, parts in continued.items():
-        joined = b"".join(v for _, v in sorted(parts))
-        # strip a leading charset'lang' from the 2231 extended form
-        m = re.match(rb"^[\w-]*'[\w-]*'(.*)$", joined)
-        merged[base] = m.group(1) if m else joined
-    return head, merged
+    return head, params
 
 
 # -- message tree -----------------------------------------------------------------------------
@@ -191,21 +188,30 @@ class Message:
         part = self.root
         numbers = section.split(".")
         # For a non-multipart top-level message, section "1" is the whole body.
-        if not part.is_multipart and numbers and numbers[0] == "1" and len(numbers) == 1:
-            if part.is_message and part.children:
-                return part.children[0]
-            return part
-        for n in numbers:
+        if not part.is_multipart:
+            if numbers[0] != "1":
+                return None
+            if len(numbers) == 1:
+                return part
+            numbers = numbers[1:]
+            if not part.is_message:
+                return None
+        for position, n in enumerate(numbers):
             idx = int(n) - 1
             if part.is_message and part.children:
                 part = part.children[0]
+                if not part.is_multipart and idx == 0:
+                    if position == len(numbers) - 1:
+                        return part
+                    if not part.is_message:
+                        return None
+                    continue
             if part.is_multipart:
                 if idx < 0 or idx >= len(part.children):
                     return None
                 part = part.children[idx]
             else:
-                if idx != 0:
-                    return None
+                return None
         return part
 
     def section_bytes(self, spec: str) -> bytes | None:
@@ -236,11 +242,13 @@ class Message:
         if part is None:
             return None
         kw = keyword.upper()
-        if kw == "" or kw == "":
+        if kw == "":
             # bare numeric section: the part's body (for message/rfc822, the encapsulated body)
             return self.raw[part.body_start : part.body_end]
         if kw == "MIME":
             return self.raw[part.header_start : part.body_start]
+        if not part.is_message:
+            return None
         if kw == "HEADER":
             inner = part.children[0] if part.is_message and part.children else part
             return self._header_bytes(inner)

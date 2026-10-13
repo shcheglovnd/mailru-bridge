@@ -33,7 +33,8 @@ class Writer:
 @pytest.fixture
 def connection(tmp_path):
     cache = Cache(tmp_path / "cache.sqlite3")
-    for fid, name in [("0", "INBOX"), ("500000", "Sent"), ("500001", "Drafts"), ("9", "Письма")]:
+    for fid, name in [("0", "INBOX"), ("500000", "Sent"), ("500001", "Drafts"),
+                      ("500002", "Trash"), ("9", "Письма")]:
         cache.upsert_folder(fid, name, "-1", "user", False, 0, 0)
         cache.set_meta(f"deep:{fid}", "1")
     api = SimpleNamespace(**{name: AsyncMock() for name in
@@ -165,8 +166,8 @@ def test_search_predicates(connection, criteria, expected):
 
 def test_unsupported_search_returns_bad_even_for_empty_folder(connection):
     select(connection)
-    dispatch(connection, b'SEARCH SUBJECT "hello"')
-    assert b"A1 BAD unsupported SEARCH predicate SUBJECT" in connection.writer.data
+    dispatch(connection, b'SEARCH UNKNOWN "hello"')
+    assert b"A1 BAD unsupported SEARCH predicate UNKNOWN" in connection.writer.data
 
 
 @pytest.mark.parametrize("data", [b")", b'"unterminated', b"(unterminated", b"a )"])
@@ -338,3 +339,192 @@ def test_fairemail_refresh_sequence_over_local_socket(connection):
         async with listener:
             await asyncio.wait_for(asyncio.to_thread(client, listener.sockets[0].getsockname()[1]), 10)
     asyncio.run(run())
+
+
+def test_failed_select_leaves_no_previous_mailbox_selected(connection):
+    select(connection, [{"\\Deleted"}])
+    connection.readonly = True
+    dispatch(connection, b"SELECT missing")
+    assert connection.selected is None
+    assert not connection.readonly and not connection.snapshot and not connection.snapshot_flags
+    dispatch(connection, b"STORE 1 +FLAGS (\\Seen)")
+    connection.s.api.mark.assert_not_awaited()
+    assert b"NO no mailbox selected" in connection.writer.data
+
+
+def test_lsub_subscription_changes_use_correct_response_type(connection):
+    connection.authed = True
+    dispatch(connection, b'LSUB "" "Drafts"')
+    assert b"* LSUB (" in connection.writer.data and b"* LIST" not in connection.writer.data
+    dispatch(connection, b"UNSUBSCRIBE Drafts")
+    connection.writer.data.clear()
+    dispatch(connection, b'LSUB "" "Drafts"')
+    assert b"* LSUB" not in connection.writer.data
+    assert connection.s.cache.get_meta("subscribed:500001") == "0"
+    dispatch(connection, b"SUBSCRIBE Drafts")
+    dispatch(connection, b'LSUB "" "Drafts"')
+    assert b"* LSUB (" in connection.writer.data
+
+
+def test_folder_names_preserve_case_and_special_parent_aliases(connection):
+    cache = connection.s.cache
+    cache.upsert_folder("10", "Finance", "-1", "user", False, 0, 0)
+    cache.upsert_folder("11", "finance", "-1", "user", False, 0, 0)
+    cache.upsert_folder("500000", "Отправленные", "-1", "sent", True, 0, 0)
+    cache.upsert_folder("12", "Child", "500000", "user", False, 0, 0)
+    connection.s.tree.refresh()
+    assert connection.s.tree.id_for("Finance") == "10"
+    assert connection.s.tree.id_for("finance") == "11"
+    assert connection.s.tree.id_for("FINANCE") is None
+    assert connection.s.tree.name_for("12") == "Sent/Child"
+
+
+def test_sasl_plain_initial_response_does_not_wait_for_challenge(connection):
+    import base64
+    connection.s.config.check_login = lambda user, pw: user == "user@example.com" and pw == "test-password"
+    encoded = base64.b64encode(b"\x00user@example.com\x00test-password")
+    dispatch(connection, b"AUTHENTICATE PLAIN " + encoded)
+    assert connection.authed
+    assert b"+ " not in connection.writer.data
+    assert "SASL-IR" in connection.s.capabilities()
+
+
+def test_cancelled_authentication_and_truncated_literal_are_recoverable(connection):
+    async def run():
+        connection.reader = asyncio.StreamReader()
+        connection.reader.feed_data(b"*\r\n")
+        await connection.dispatch([("t", b"A1 AUTHENTICATE PLAIN")])
+        assert not connection.authed
+        assert b"A1 BAD AUTHENTICATE cancelled" in connection.writer.data
+        connection.authed = True
+        connection.reader.feed_data(b"A2 APPEND Drafts {4+}\r\nbody")
+        connection.reader.feed_eof()
+        assert await connection.read_command() is None
+        connection.s.api.save_draft.assert_not_awaited()
+    asyncio.run(run())
+
+
+def test_move_publishes_old_message_in_destination_and_preserves_raw_cache(connection):
+    select(connection, [set()])
+    raw = b"Subject: old message\r\nMessage-ID: <old@example.com>\r\n\r\nbody"
+    connection.s.cache.set_raw("0", 1, raw)
+    connection.s.cache.add_message("500000", "99999", 200, 1, set(), {})
+    dispatch(connection, b"UID MOVE 1 Sent")
+    moved = connection.s.cache.message_by_uid("500000", 2)
+    assert moved.mailru_id == "100"
+    assert connection.s.cache.get_raw("500000", 2) == raw
+    assert moved.meta["headers"]["message-id"] == ["<old@example.com>"]
+    assert connection.s.cache.counts("0") == (0, 0)
+
+
+def test_move_to_same_mailbox_does_not_forget_message(connection):
+    select(connection, [set()])
+    dispatch(connection, b"UID MOVE 1 INBOX")
+    connection.s.api.move.assert_not_awaited()
+    assert connection.s.cache.message_by_uid("0", 1) is not None
+    assert b"A1 NO" in connection.writer.data
+
+
+def test_expunge_keeps_cached_copy_in_trash_without_deleted_flag(connection):
+    select(connection, [{"\\Deleted"}])
+    dispatch(connection, b"EXPUNGE")
+    moved = connection.s.cache.messages("500002")
+    assert len(moved) == 1 and moved[0].mailru_id == "100"
+    assert "\\Deleted" not in moved[0].flags
+
+
+def test_charset_failure_uses_badcharset_response(connection):
+    select(connection)
+    dispatch(connection, b"SEARCH CHARSET KOI8-R ALL")
+    assert b"A1 NO [BADCHARSET (US-ASCII UTF-8)]" in connection.writer.data
+    connection.s.syncer.incremental_sync.assert_not_awaited()
+
+
+def test_missing_body_section_returns_nil_and_does_not_mark_seen(connection):
+    from mailru_bridge.sync import Syncer
+    select(connection, [set()])
+    connection.s.cache.set_raw("0", 1, b"Subject: example\r\n\r\nbody")
+    connection.s.syncer = Syncer(connection.s.api, connection.s.cache)
+    dispatch(connection, b"UID FETCH 1 BODY[99]")
+    assert b"BODY[99] NIL" in connection.writer.data
+    connection.s.api.mark.assert_not_awaited()
+
+
+def test_cached_envelope_retains_message_id_reply_to_and_encoded_words(connection):
+    select(connection, [set()])
+    raw = (b"Subject: =?utf-8?b?SGVsbG8=?=\r\nMessage-ID: <source@example.com>\r\n"
+           b"Reply-To: Reply <reply@example.com>\r\n\r\nbody")
+    connection.s.cache.set_raw("0", 1, raw)
+    dispatch(connection, b"UID FETCH 1 ENVELOPE")
+    assert b"<source@example.com>" in connection.writer.data
+    assert b'"reply" "example.com"' in connection.writer.data
+
+
+def test_auth_subscription_literal_header_search_and_sent_date_over_socket(connection):
+    import base64
+    select(connection, [set()])
+    raw = (b"Date: Mon, 12 Oct 2026 23:50:00 -0700\r\nMessage-ID: <message@example.com>\r\n"
+           b"Subject: =?utf-8?b?SGVsbG8=?=\r\nContent-Type: text/plain\r\n\r\nworld")
+    connection.s.cache.set_raw("0", 1, raw)
+    connection.s.config.check_login = lambda user, password: user == "user@example.com" and password == "test-password"
+
+    async def run():
+        listener = await asyncio.start_server(connection.s._handle, "127.0.0.1", 0)
+        async with listener:
+            reader, writer = await asyncio.open_connection('127.0.0.1', listener.sockets[0].getsockname()[1])
+            await reader.readline()
+            async def command(tag, text):
+                writer.write(tag + b" " + text + b"\r\n")
+                await writer.drain()
+                lines = []
+                while True:
+                    line = await asyncio.wait_for(reader.readline(), 5)
+                    assert line
+                    lines.append(line)
+                    if line.startswith(tag + b" "):
+                        assert line.startswith(tag + b" OK"), line
+                        return b"".join(lines)
+            encoded = base64.b64encode(b"\x00user@example.com\x00test-password")
+            await command(b"A1", b"AUTHENTICATE PLAIN " + encoded)
+            assert b"* LSUB" in await command(b"A2", b'LSUB "" "INBOX"')
+            await command(b"A3", b"SELECT INBOX")
+            assert b"* SEARCH 1\r\n" in await command(b"A4", b"SEARCH SENTON 12-Oct-2026")
+            phrase = b"<message@example.com>"
+            wire = b"SEARCH OR (HEADER Message-ID {" + str(len(phrase)).encode() + b"+}\r\n" + phrase + b') (SUBJECT "missing")'
+            assert b"* SEARCH 1\r\n" in await command(b"A5", wire)
+            await command(b"A6", b"LOGOUT")
+            writer.close()
+            await writer.wait_closed()
+    asyncio.run(run())
+
+
+def test_search_skips_externally_removed_message_and_returns_remaining_matches(connection):
+    from mailru_bridge.api import NotFound
+    select(connection, [set(), set()])
+    async def source(fid, uid):
+        if uid == 1:
+            connection.s.cache.forget(fid, [uid])
+            raise NotFound("removed", 404)
+        return b"Subject: survivor\r\n\r\nbody"
+    connection.s.syncer.ensure_raw = source
+    dispatch(connection, b'SEARCH BODY "body"')
+    assert b"* SEARCH 2\r\n" in connection.writer.data
+    assert b"A1 OK SEARCH completed" in connection.writer.data
+    assert b"EXPUNGE" not in connection.writer.data
+
+
+def test_create_does_not_silently_fall_back_to_root_when_parent_is_missing(connection):
+    connection.authed = True
+    dispatch(connection, b"CREATE missing/child")
+    connection.s.api.create_folder.assert_not_awaited()
+    assert b"NO parent mailbox does not exist" in connection.writer.data
+
+
+def test_rename_updates_parent_and_rejects_system_mailboxes(connection):
+    connection.authed = True
+    dispatch(connection, b"RENAME " + encode("Письма") + b" Sent/Child")
+    connection.s.api.rename_folder.assert_awaited_once_with("9", "Child", parent="500000")
+    connection.s.api.rename_folder.reset_mock()
+    dispatch(connection, b"RENAME Sent Other")
+    connection.s.api.rename_folder.assert_not_awaited()
+    assert b"NO system mailbox cannot be renamed" in connection.writer.data

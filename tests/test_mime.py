@@ -50,7 +50,7 @@ def test_parse_params_quoted_and_2231():
     assert params["charset"] == b"utf-8"
     assert params["name"] == b"a.txt"
     _, p2 = parse_params(b"application/x; name*=utf-8''%E2%9C%93.bin")
-    assert b"%E2%9C%93.bin" in p2["name"]
+    assert p2["name*"] == b"utf-8''%E2%9C%93.bin"
 
 
 def test_body_lines():
@@ -73,3 +73,31 @@ def test_empty_mime_headers_and_missing_closing_boundary():
     msg = Message(raw)
     assert msg.section_bytes("1") == b"body\r\n"
     assert msg.section_bytes("1.MIME") == b"\r\n"
+
+
+def test_nonexistent_nested_sections_are_not_aliases_for_plain_body():
+    msg = Message(b"Content-Type: text/plain\r\n\r\nbody")
+    assert msg.section_bytes("1") == b"body"
+    assert msg.section_bytes("1.1") is None
+    assert msg.section_bytes("1.HEADER") is None
+    assert msg.section_bytes("0") is None
+
+
+def test_forwarded_message_sections_keep_encapsulated_headers():
+    inner = b"From: Alice <alice@example.com>\r\nContent-Type: text/plain\r\n\r\ninner body"
+    msg = Message(b"Content-Type: message/rfc822\r\n\r\n" + inner)
+    assert msg.section_bytes("1") == inner
+    assert msg.section_bytes("1.HEADER").startswith(b"From:")
+    assert msg.section_bytes("1.1") == b"inner body"
+    raw = (b"Content-Type: multipart/mixed; boundary=B\r\n\r\n"
+           b"--B\r\nContent-Type: text/plain\r\n\r\nouter\r\n"
+           b"--B\r\nContent-Type: message/rfc822\r\n\r\n" + inner + b"\r\n--B--\r\n")
+    msg = Message(raw)
+    assert msg.section_bytes("2") == inner
+    assert msg.section_bytes("2.1") == b"inner body"
+    assert msg.section_bytes("2.HEADER").startswith(b"From:")
+
+
+def test_rfc2231_continuations_keep_charset_and_segment_names():
+    _, params = parse_params(b"attachment; filename*0*=utf-8''%E2%9C; filename*1*=%93.bin")
+    assert params == {"filename*0*": b"utf-8''%E2%9C", "filename*1*": b"%93.bin"}

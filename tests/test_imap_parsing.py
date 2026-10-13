@@ -5,6 +5,7 @@ from mailru_bridge.imap_server import (
     parse_sequence_set,
 )
 from mailru_bridge.imap_utf7 import decode, encode
+import pytest
 
 
 def test_utf7_roundtrip():
@@ -49,3 +50,14 @@ def test_wildcard_to_regex():
     assert _wildcard_to_regex("*").match("Anything/Here")
     assert _wildcard_to_regex("A/%").match("A/B")
     assert not _wildcard_to_regex("A/%").match("A/B/C")
+
+
+@pytest.mark.parametrize("item", ["UNKNOWN", "BODY.PEEK", "BODY[0]", "BODY[1..2]", "BODY[1]<0>", "()"])
+def test_unsupported_fetch_items_are_rejected(item):
+    with pytest.raises(ValueError):
+        _parse_fetch_items(item)
+
+
+def test_literal_inside_nested_group_is_kept_opaque():
+    tokens = [("t", b"OR (HEADER Subject "), ("l", b"(a quoted subject)"), ("t", b") ALL")]
+    assert _split_astrings(tokens) == ["OR", ["HEADER", "Subject", b"(a quoted subject)"], "ALL"]

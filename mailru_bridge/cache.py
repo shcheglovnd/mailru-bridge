@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 """
 
 # Flags controlled by Mail.ru; all other flags (notably \Deleted) are local state.
-REMOTE_FLAGS = {"\\Seen", "\\Flagged", "\\Answered", "$Forwarded"}
+REMOTE_FLAGS = {"\\Seen", "\\Flagged", "\\Answered", "\\Draft", "$Forwarded"}
 MESSAGE_COLUMNS = "folder_id,uid,mailru_id,date,size,flags,deleted,meta"
 
 
@@ -150,7 +150,7 @@ class Cache:
                     self._conn.execute("DELETE FROM folders WHERE id=?", (fid,))
                     self._conn.executemany("DELETE FROM meta WHERE k=?",
                                            [(f"{prefix}:{fid}",) for prefix in
-                                            ("deep", "flags_dirty", "flags_sync")])
+                                            ("deep", "flags_dirty", "flags_sync", "subscribed")])
 
     # -- messages --------------------------------------------------------------------------
 
@@ -251,6 +251,34 @@ class Cache:
                         updates.append((flags, fid, row["uid"]))
             self._conn.executemany("UPDATE messages SET flags=? WHERE folder_id=? AND uid=?", updates)
 
+    def update_remote_messages_batch(self, fid: str, items: list[tuple]) -> None:
+        """Refresh summaries, keeping immutable sources and invalidating mutable draft bodies."""
+        incoming = {item[0]: item[1:] for item in items}
+        with self._lock, self._conn:
+            updates = []
+            for row in self._conn.execute(
+                    "SELECT uid,mailru_id,date,size,flags,meta,raw IS NOT NULL AS has_raw "
+                    "FROM messages WHERE folder_id=?", (fid,)):
+                item = incoming.get(row["mailru_id"])
+                if item is None:
+                    continue
+                date, remote_size, remote_flags, meta = item
+                old_meta = json.loads(row["meta"]) if row["meta"] else {}
+                new_meta = old_meta | meta
+                # The web/app can edit a draft without changing its id or byte count. Re-read
+                # its source on the next FETCH instead of serving the previous saved revision.
+                invalidate = fid == "500001" and bool(row["has_raw"])
+                if invalidate:
+                    new_meta.pop("headers", None)
+                size = row["size"] if row["has_raw"] and not invalidate else remote_size
+                flags = _flags_to_text(remote_flags | (_text_to_flags(row["flags"]) - REMOTE_FLAGS))
+                encoded = json.dumps(new_meta, ensure_ascii=False)
+                if (date, size, flags, encoded) != (row["date"], row["size"], row["flags"], row["meta"]) or invalidate:
+                    updates.append((date, size, flags, encoded, int(invalidate), fid, row["uid"]))
+            self._conn.executemany(
+                "UPDATE messages SET date=?,size=?,flags=?,meta=?,raw=CASE WHEN ? THEN NULL ELSE raw END "
+                "WHERE folder_id=? AND uid=?", updates)
+
     def mark_all_seen(self, fid: str) -> int:
         """Apply an authoritative remote unread count of zero to all cached messages."""
         with self._lock, self._conn:
@@ -265,11 +293,23 @@ class Cache:
 
     def set_raw(self, fid: str, uid: int, raw: bytes) -> None:
         with self._lock:
+            self.set_headers(fid, uid, raw)
             self._conn.execute(
                 "UPDATE messages SET raw=?,size=? WHERE folder_id=? AND uid=?",
                 (raw, len(raw), fid, uid),
             )
             self._conn.commit()
+
+    def set_headers(self, fid: str, uid: int, raw: bytes) -> None:
+        from .mime import decoded_headers
+
+        with self._lock:
+            msg = self.message_by_uid(fid, uid)
+            if msg is not None:
+                msg.meta["headers"] = decoded_headers(raw)
+                self._conn.execute("UPDATE messages SET meta=? WHERE folder_id=? AND uid=?",
+                                   (json.dumps(msg.meta, ensure_ascii=False), fid, uid))
+                self._conn.commit()
 
     def get_raw(self, fid: str, uid: int) -> bytes | None:
         with self._lock:
@@ -293,6 +333,42 @@ class Cache:
                 "DELETE FROM messages WHERE folder_id=? AND uid=?", [(fid, u) for u in uids]
             )
             self._conn.commit()
+
+    def move_messages(self, source: str, destination: str, uids: list[int]) -> dict[int, int]:
+        """Mirror a successful remote move atomically, preserving cached sources and metadata."""
+        if source == destination:
+            raise ValueError("source and destination are the same")
+        with self._lock, self._conn:
+            folder = self.folder(destination)
+            if folder is None:
+                raise KeyError(f"no such folder {destination}")
+            next_uid = folder["uidnext"]
+            mapping = {}
+            for uid in uids:
+                msg = self.message_by_uid(source, uid)
+                if msg is None:
+                    continue
+                dest_uid = self.uid_for(destination, msg.mailru_id)
+                flags = msg.flags - {"\\Deleted", "\\Draft"}
+                if destination == "500001":
+                    flags.add("\\Draft")
+                if dest_uid is None:
+                    dest_uid = next_uid
+                    next_uid += 1
+                    self._conn.execute(
+                        "INSERT INTO messages(folder_id,uid,mailru_id,date,size,flags,deleted,meta,raw) "
+                        "SELECT ?,?,mailru_id,date,size,?,0,meta,raw FROM messages WHERE folder_id=? AND uid=?",
+                        (destination, dest_uid, _flags_to_text(flags), source, uid))
+                else:
+                    self._conn.execute(
+                        "UPDATE messages SET (date,size,meta,raw)="
+                        "(SELECT date,size,meta,raw FROM messages WHERE folder_id=? AND uid=?),"
+                        "flags=?,deleted=0 WHERE folder_id=? AND uid=?",
+                        (source, uid, _flags_to_text(flags), destination, dest_uid))
+                self._conn.execute("DELETE FROM messages WHERE folder_id=? AND uid=?", (source, uid))
+                mapping[uid] = dest_uid
+            self._conn.execute("UPDATE folders SET uidnext=? WHERE id=?", (next_uid, destination))
+            return mapping
 
     def live_mailru_ids(self, fid: str) -> set[str]:
         with self._lock:

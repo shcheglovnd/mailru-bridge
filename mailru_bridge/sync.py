@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import time
 
-from .api import MailruApi, RemoteMessage
+from .api import MailruApi, NotFound, RemoteMessage
 from .cache import Cache
 
 log = logging.getLogger(__name__)
@@ -43,6 +43,8 @@ def imap_flags(m: RemoteMessage) -> set[str]:
         flags.add("\\Answered")
     if m.forwarded:
         flags.add("$Forwarded")
+    if m.folder == "500001":
+        flags.add("\\Draft")
     return flags
 
 
@@ -52,6 +54,8 @@ def _meta(m: RemoteMessage) -> dict:
         "from": m.sender,
         "to": m.to,
         "cc": m.cc,
+        "bcc": m.bcc,
+        "remote_size": m.size,
         "thread": m.thread_id,
         "attachments": m.has_attachments,
     }
@@ -71,9 +75,9 @@ class Syncer:
                 changed = self.cache.mark_all_seen(f.id)
                 if changed:
                     log.info("folder %s: %d cached messages now read", f.id, changed)
-                if self.cache.get_meta(f"flags_dirty:{f.id}") == "1":
-                    self.cache.set_meta(f"flags_dirty:{f.id}", "0")
             elif previous and previous["total"] == f.total and previous["unread"] != f.unread:
+                self.cache.set_meta(f"flags_dirty:{f.id}", "1")
+            if previous and f.total < previous["total"]:
                 self.cache.set_meta(f"flags_dirty:{f.id}", "1")
             self.cache.upsert_folder(f.id, f.name, f.parent, f.type, f.system, f.total, f.unread)
         self.cache.prune_folders({f.id for f in folders})
@@ -107,7 +111,8 @@ class Syncer:
             fid,
             [(m.id, m.date, m.size, imap_flags(m), _meta(m)) for m in reversed(collected)],
         )
-        self.cache.update_remote_flags_batch(fid, {m.id: imap_flags(m) for m in collected})
+        self.cache.update_remote_messages_batch(
+            fid, [(m.id, m.date, m.size, imap_flags(m), _meta(m)) for m in collected])
         now = time.time()
         self.cache.set_last_sync(fid, now)
         self.cache.set_meta(f"flags_sync:{fid}", str(now))
@@ -161,7 +166,8 @@ class Syncer:
         new_count = self.cache.add_messages_batch(
             fid, [(m.id, m.date, m.size, imap_flags(m), _meta(m)) for m in reversed(fresh)]
         )
-        self.cache.update_remote_flags_batch(fid, {m.id: imap_flags(m) for m in seen_remote})
+        self.cache.update_remote_messages_batch(
+            fid, [(m.id, m.date, m.size, imap_flags(m), _meta(m)) for m in seen_remote])
 
         # Deletion detection by id-range, NOT by Date header: Mail.ru ids are assigned in true
         # arrival order (the list is sorted id-desc), but Date headers arrive wildly out of order
@@ -197,11 +203,18 @@ class Syncer:
         """Return the RFC 822 source for a message, downloading and caching it on first use."""
         cached = self.cache.get_raw(fid, uid)
         if cached is not None:
+            cm = self.cache.message_by_uid(fid, uid)
+            if cm is not None and "headers" not in cm.meta:
+                self.cache.set_headers(fid, uid, cached)
             return cached
         cm = self.cache.message_by_uid(fid, uid)
         if cm is None:
             raise KeyError(f"no such uid {uid} in folder {fid}")
-        raw = await self.api.download(cm.mailru_id, fid)
+        try:
+            raw = await self.api.download(cm.mailru_id, fid)
+        except NotFound:
+            self.cache.forget(fid, [uid])
+            raise
         from .mime import normalize
 
         raw = normalize(raw)
