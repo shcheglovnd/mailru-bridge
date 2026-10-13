@@ -23,6 +23,13 @@ from .cache import Cache
 log = logging.getLogger(__name__)
 
 
+def _as_int(mailru_id: str) -> int | None:
+    try:
+        return int(mailru_id)
+    except (TypeError, ValueError):
+        return None
+
+
 def imap_flags(m: RemoteMessage) -> set[str]:
     flags: set[str] = set()
     if not m.unread:
@@ -114,15 +121,20 @@ class Syncer:
                 if uid is not None:
                     self.cache.update_flags(fid, uid, imap_flags(m))
 
-        # Deletion detection, limited to the window we actually scanned: a cached message whose date
-        # is within the oldest scanned date but is missing from the remote set is gone.
+        # Deletion detection by id-range, NOT by Date header: Mail.ru ids are assigned in true
+        # arrival order (the list is sorted id-desc), but Date headers arrive wildly out of order
+        # (delayed/backdated delivery), so a date window spuriously expunges live messages and makes
+        # them flap. We scanned the newest ids down to min_scanned_id; any cached message with an id
+        # at or above that bound but absent from the scan is genuinely gone.
         expunged: list[int] = []
-        if seen_remote and (total is None or offset < total or len(seen_remote) >= total):
-            oldest_scanned_date = min(m.date for m in seen_remote)
+        scanned_ids = [_as_int(m.id) for m in seen_remote if _as_int(m.id) is not None]
+        if scanned_ids:
+            min_scanned_id = min(scanned_ids)
             for cm in self.cache.messages(fid):
                 if cm.mailru_id in remote_ids:
                     continue
-                if cm.date >= oldest_scanned_date:
+                cid = _as_int(cm.mailru_id)
+                if cid is not None and cid >= min_scanned_id:
                     expunged.append(cm.uid)
             if expunged:
                 self.cache.forget(fid, expunged)

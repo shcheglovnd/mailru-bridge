@@ -263,8 +263,9 @@ class ImapConnection:
             return await handler(tag, rest, rest_tokens)
         finally:
             dt = _t.monotonic() - t0
-            if dt > 0.5:
-                log.info("IMAP %s %s -> %.1fs", command, preview, dt)
+            if dt > 1.0:
+                log.info("IMAP[%s] %s %s -> %.1fs (snap=%d)",
+                         self.peer[0] if self.peer else "?", command, preview, dt, len(self.snapshot))
 
     # -- basic -----------------------------------------------------------------------------
 
@@ -991,23 +992,29 @@ class ImapServer:
             await self.syncer.sync_folders()
         self.tree.refresh()
 
+    def _deep_synced(self, fid: str) -> bool:
+        # Persisted so a restart doesn't re-pull history (the cache survives). A shallow STATUS
+        # sync must NOT set this, or SELECT would never load the full depth.
+        return self.cache.get_meta(f"deep:{fid}") == "1"
+
     async def ensure_initial(self, fid: str) -> None:
-        if fid in self._initial:
-            await self.incremental(fid)
-            return
-        folder = self.cache.folder(fid)
-        if folder is None or folder["last_sync"] == 0:
-            await self.syncer.initial_sync(fid, depth=self.config.initial_depth)
+        """On SELECT: do the full initial sync once per folder (to initial_depth), else incremental."""
+        if not self._deep_synced(fid):
+            async with self._lock:
+                await self.syncer.initial_sync(fid, depth=self.config.initial_depth)
+            self.cache.set_meta(f"deep:{fid}", "1")
         else:
             await self.incremental(fid)
         self._initial.add(fid)
 
     async def sync_folder_quietly(self, fid: str) -> None:
-        folder = self.cache.folder(fid)
-        if folder is None or folder["last_sync"] == 0:
-            await self.syncer.initial_sync(fid, depth=min(self.config.initial_depth, 500))
-        else:
+        """For STATUS: a light touch only. Never claims a deep sync, so SELECT still loads depth."""
+        if self._deep_synced(fid):
             await self.incremental(fid)
+        else:
+            folder = self.cache.folder(fid)
+            if folder is None or folder["last_sync"] == 0:
+                await self.syncer.initial_sync(fid, depth=min(self.config.initial_depth, 300))
 
     async def incremental(self, fid: str) -> tuple[int, list[int]]:
         async with self._lock:
