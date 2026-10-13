@@ -2,7 +2,7 @@
 
 This is what ``mailru-bridge serve`` starts. It owns the shared :class:`~mailru_bridge.api.MailruApi`
 (one rate-limited "device"), the local :class:`~mailru_bridge.cache.Cache`, the IMAP and SMTP
-servers, and a background task that keeps the Inbox fresh so an idling client is told about new mail.
+servers, and a background task that keeps all cached folders fresh for clients.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ class BridgeService:
         self.api = MailruApi(account, limiter=RateLimiter(), on_auth_expired=self._on_auth_expired)
         self.cache = cache or Cache()
         self._last_alert: float | None = None
-        self.syncer = Syncer(self.api, self.cache)
+        self.syncer = Syncer(self.api, self.cache, flag_refresh_seconds=config.flag_refresh_seconds)
         self.imap = ImapServer(account, self.api, self.cache, self.syncer, config)
         self.smtp = SmtpServer(account, self.api, config, self._send_message)
 
@@ -80,11 +80,19 @@ class BridgeService:
         while True:
             await asyncio.sleep(self.config.poll_seconds)
             try:
-                folder = self.cache.folder("0")
-                if folder and folder["last_sync"]:
-                    await self.imap.incremental("0")
+                await self._poll_cached_folders()
             except Exception:  # noqa: BLE001
                 log.debug("background poll failed", exc_info=True)
+
+    async def _poll_cached_folders(self) -> None:
+        await self.imap.sync_folders()
+        for folder in self.cache.folders():
+            if not folder["last_sync"]:
+                continue
+            try:
+                await self.imap.incremental(folder["id"])
+            except Exception:
+                log.debug("background poll failed for folder %s", folder["id"], exc_info=True)
 
     async def run(self) -> None:
         tasks = []

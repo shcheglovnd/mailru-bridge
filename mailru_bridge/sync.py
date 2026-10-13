@@ -8,6 +8,8 @@ API for mail content. It does three jobs:
   stable IMAP UID, inserting oldest-first so UIDs rise with date within the first batch.
 * **incremental sync** — pull the newest page, add anything unseen, refresh flags, and notice server
   side deletions by diffing the newest window against the cache.
+* **older flags** — use zero-unread folder counters for bulk reads; periodically, or after an unread
+  counter change, page summaries down to the oldest cached message to refresh older flags too.
 
 Flag mapping (Mail.ru → IMAP): ``unread=false`` → ``\Seen``; ``flagged`` → ``\Flagged``;
 ``reply`` → ``\Answered``; ``forward`` → the ``$Forwarded`` keyword.
@@ -16,6 +18,7 @@ Flag mapping (Mail.ru → IMAP): ``unread=false`` → ``\Seen``; ``flagged`` →
 from __future__ import annotations
 
 import logging
+import time
 
 from .api import MailruApi, RemoteMessage
 from .cache import Cache
@@ -55,15 +58,36 @@ def _meta(m: RemoteMessage) -> dict:
 
 
 class Syncer:
-    def __init__(self, api: MailruApi, cache: Cache):
+    def __init__(self, api: MailruApi, cache: Cache, flag_refresh_seconds: int = 900):
         self.api = api
         self.cache = cache
+        self.flag_refresh_seconds = flag_refresh_seconds
 
     async def sync_folders(self) -> None:
         folders = await self.api.folders()
         for f in folders:
+            previous = self.cache.folder(f.id)
+            if f.unread == 0:
+                changed = self.cache.mark_all_seen(f.id)
+                if changed:
+                    log.info("folder %s: %d cached messages now read", f.id, changed)
+                if self.cache.get_meta(f"flags_dirty:{f.id}") == "1":
+                    self.cache.set_meta(f"flags_dirty:{f.id}", "0")
+            elif previous and previous["total"] == f.total and previous["unread"] != f.unread:
+                self.cache.set_meta(f"flags_dirty:{f.id}", "1")
             self.cache.upsert_folder(f.id, f.name, f.parent, f.type, f.system, f.total, f.unread)
         self.cache.prune_folders({f.id for f in folders})
+
+    def _flags_refresh_due(self, fid: str) -> bool:
+        if self.cache.get_meta(f"flags_dirty:{fid}") == "1":
+            return True
+        saved = self.cache.get_meta(f"flags_sync:{fid}")
+        if not saved:
+            # Existing caches acquire this timestamp gradually, avoiding a history-download
+            # burst on upgrade. The zero-unread shortcut above still repairs bulk reads now.
+            self.cache.set_meta(f"flags_sync:{fid}", str(time.time()))
+            return False
+        return time.time() - float(saved) >= self.flag_refresh_seconds
 
     async def initial_sync(self, fid: str, depth: int = 2000, page: int = 200) -> int:
         """Load up to ``depth`` newest messages of a folder. Returns how many are now cached."""
@@ -84,14 +108,18 @@ class Syncer:
             [(m.id, m.date, m.size, imap_flags(m), _meta(m)) for m in reversed(collected)],
         )
         self.cache.update_remote_flags_batch(fid, {m.id: imap_flags(m) for m in collected})
-        import time as _t
-
-        self.cache.set_last_sync(fid, _t.time())
+        now = time.time()
+        self.cache.set_last_sync(fid, now)
+        self.cache.set_meta(f"flags_sync:{fid}", str(now))
         log.info("initial sync %s: %d messages", fid, len(collected))
         return len(collected)
 
-    async def incremental_sync(self, fid: str, window: int = 200, page: int = 200) -> tuple[int, list[int]]:
-        """Refresh the newest ``window`` messages. Returns (new_count, expunged_uids).
+    async def incremental_sync(self, fid: str, window: int = 200, page: int = 200,
+                               refresh_flags: bool | None = None) -> tuple[int, list[int]]:
+        """Refresh new mail and, when due, flags throughout cached history.
+
+        Returns (new_count, expunged_uids). A changed unread counter or the periodic flags timer
+        extends pagination down to the oldest cached id, without fetching any message bodies.
 
         New messages are added with fresh UIDs; flags are refreshed; any cached message that falls
         inside the scanned window but is no longer on the server is marked deleted and its UID
@@ -103,8 +131,12 @@ class Syncer:
         stable = True
         modified = None
         known = self.cache.live_mailru_ids(fid)
+        if refresh_flags is None:
+            refresh_flags = self._flags_refresh_due(fid)
+        oldest = min((_as_int(mid) for mid in known if _as_int(mid) is not None), default=None)
+        covered = not refresh_flags or not known
         overlap = False
-        while len(seen_remote) < window or (known and not overlap):
+        while len(seen_remote) < window or (known and not overlap) or not covered:
             limit = min(page, window - len(seen_remote)) if len(seen_remote) < window else page
             result = await self.api.messages(fid, offset=offset, limit=limit)
             if total is not None and result.total != total:
@@ -116,6 +148,9 @@ class Syncer:
                 break
             seen_remote.extend(result.messages)
             overlap = overlap or any(m.id in known for m in result.messages)
+            numeric = [_as_int(m.id) for m in result.messages if _as_int(m.id) is not None]
+            if oldest is not None and numeric and min(numeric) <= oldest:
+                covered = True
             offset += len(result.messages)
             if offset >= result.total:
                 break
@@ -148,9 +183,12 @@ class Syncer:
             if expunged:
                 self.cache.forget(fid, expunged)
 
-        import time as _t
-
-        self.cache.set_last_sync(fid, _t.time())
+        now = time.time()
+        self.cache.set_last_sync(fid, now)
+        if refresh_flags and stable and (covered or complete):
+            self.cache.set_meta(f"flags_sync:{fid}", str(now))
+            self.cache.set_meta(f"flags_dirty:{fid}", "0")
+            log.info("flags refresh %s: %d message summaries checked", fid, len(seen_remote))
         if new_count or expunged:
             log.info("incremental %s: +%d new, -%d gone", fid, new_count, len(expunged))
         return new_count, expunged

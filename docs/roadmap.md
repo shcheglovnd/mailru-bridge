@@ -48,6 +48,9 @@
       UID `*`/MOVE/EXPUNGE, multiple-client snapshots, local deletion marks preserved during sync,
       empty/deleted folders reconciled, SMTP transaction/DATA handling, safe mutation retry policy,
       credential-free command logging and saved-login reload. Regression tests include local sockets.
+- [x] Web read-state sync across cached history: authoritative zero-unread reconciliation, broader
+      scans on changed unread counts, periodic flag refresh, and background polling of all cached
+      folders. Older flag updates are included in selected clients' IMAP notifications.
 - [ ] Richer SEARCH (header/body/date predicates) — flags, sequence/UID sets and boolean combinations
       work; unsupported keys are rejected explicitly.
 - [ ] Packaging and client setup docs for Thunderbird / FairEmail.

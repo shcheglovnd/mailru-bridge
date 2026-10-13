@@ -82,6 +82,11 @@ message; the full source is fetched once when you open a message and then cached
 and flagged, move, delete (to Trash), create/rename/delete folders, IDLE, and sending with
 attachments. `COPY` is not supported (Mail.ru has no copy — use move); arbitrary `APPEND` is limited
 (only Drafts is supported; Sent APPEND returns an error rather than claiming to store a copy).
+Background polling covers every folder already present in the cache. A remote zero-unread count
+updates all cached messages in that folder on the next poll, so web "mark all as read" reaches older
+mail too. Older message flags are also rechecked periodically (default 15 minutes, configurable with
+`setup --flag-refresh <seconds>`); this scans message summaries down to the oldest cached message,
+without downloading bodies or resetting UIDs.
 SEARCH supports flags, sequence/UID sets, AND, OR, NOT and grouping. Unsupported text/date
 predicates return an error. Read-only `EXAMINE` sessions cannot modify mail.
 

@@ -148,7 +148,9 @@ class Cache:
                 if fid not in live_ids:
                     self._conn.execute("DELETE FROM messages WHERE folder_id=?", (fid,))
                     self._conn.execute("DELETE FROM folders WHERE id=?", (fid,))
-                    self._conn.execute("DELETE FROM meta WHERE k=?", (f"deep:{fid}",))
+                    self._conn.executemany("DELETE FROM meta WHERE k=?",
+                                           [(f"{prefix}:{fid}",) for prefix in
+                                            ("deep", "flags_dirty", "flags_sync")])
 
     # -- messages --------------------------------------------------------------------------
 
@@ -248,6 +250,18 @@ class Cache:
                     if flags != row["flags"]:
                         updates.append((flags, fid, row["uid"]))
             self._conn.executemany("UPDATE messages SET flags=? WHERE folder_id=? AND uid=?", updates)
+
+    def mark_all_seen(self, fid: str) -> int:
+        """Apply an authoritative remote unread count of zero to all cached messages."""
+        with self._lock, self._conn:
+            updates = []
+            for row in self._conn.execute(
+                    "SELECT uid,flags FROM messages WHERE folder_id=? AND deleted=0", (fid,)):
+                flags = _text_to_flags(row["flags"])
+                if "\\Seen" not in flags:
+                    updates.append((_flags_to_text(flags | {"\\Seen"}), fid, row["uid"]))
+            self._conn.executemany("UPDATE messages SET flags=? WHERE folder_id=? AND uid=?", updates)
+            return len(updates)
 
     def set_raw(self, fid: str, uid: int, raw: bytes) -> None:
         with self._lock:

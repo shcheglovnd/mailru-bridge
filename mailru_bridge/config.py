@@ -52,6 +52,7 @@ class BridgeConfig:
     poll_seconds: int = 180
     initial_depth: int = 2000  # newest messages to sync per folder on first run
     sync_window: int = 200  # newest messages re-checked each incremental poll
+    flag_refresh_seconds: int = 900  # periodically recheck flags across all cached history
     # Shell command run (message appended as one argument) when the bridge cannot authenticate and a
     # `mailru-bridge login` is needed. Kept out of the code so the host owns any notifier secrets.
     alert_command: str = ""
@@ -81,7 +82,7 @@ class BridgeConfig:
                 raise ValueError("ports must be between 1 and 65535")
         if self.imap_port == self.smtp_port:
             raise ValueError("IMAP and SMTP must use different ports")
-        if min(self.poll_seconds, self.initial_depth, self.sync_window) <= 0:
+        if min(self.poll_seconds, self.initial_depth, self.sync_window, self.flag_refresh_seconds) <= 0:
             raise ValueError("poll interval and sync depths must be positive")
 
     @property

@@ -19,6 +19,7 @@ import asyncio
 import logging
 import re
 import ssl
+import time
 from email.utils import formatdate
 
 from .api import ApiError, AuthExpired, MailruApi
@@ -1074,6 +1075,7 @@ class ImapServer:
         self.tree = MailboxTree(cache)
         self._initial: set[str] = set()
         self._lock = asyncio.Lock()
+        self._folders_synced_at = 0.0
 
     def capabilities(self) -> str:
         caps = ["IMAP4rev1", "AUTH=PLAIN", "IDLE", "MOVE", "LITERAL+", "NAMESPACE", "ID", "UNSELECT"]
@@ -1092,7 +1094,15 @@ class ImapServer:
     async def sync_folders(self) -> None:
         async with self._lock:
             await self.syncer.sync_folders()
-        self.tree.refresh()
+            self._folders_synced_at = time.monotonic()
+            self.tree.refresh()
+
+    async def _incremental_locked(self, fid: str) -> tuple[int, list[int]]:
+        if time.monotonic() - self._folders_synced_at >= self.config.poll_seconds:
+            await self.syncer.sync_folders()
+            self._folders_synced_at = time.monotonic()
+            self.tree.refresh()
+        return await self.syncer.incremental_sync(fid, window=self.config.sync_window)
 
     def _deep_synced(self, fid: str) -> bool:
         # Persisted so a restart doesn't re-pull history (the cache survives). A shallow STATUS
@@ -1106,22 +1116,24 @@ class ImapServer:
                 await self.syncer.initial_sync(fid, depth=self.config.initial_depth)
                 self.cache.set_meta(f"deep:{fid}", "1")
             else:
-                await self.syncer.incremental_sync(fid, window=self.config.sync_window)
+                await self._incremental_locked(fid)
         self._initial.add(fid)
 
     async def sync_folder_quietly(self, fid: str) -> None:
         """For STATUS: a light touch only. Never claims a deep sync, so SELECT still loads depth."""
         async with self._lock:
             if self._deep_synced(fid):
-                await self.syncer.incremental_sync(fid, window=self.config.sync_window)
+                await self._incremental_locked(fid)
             else:
                 folder = self.cache.folder(fid)
                 if folder is None or folder["last_sync"] == 0:
                     await self.syncer.initial_sync(fid, depth=min(self.config.initial_depth, 300))
+                else:
+                    await self._incremental_locked(fid)
 
     async def incremental(self, fid: str) -> tuple[int, list[int]]:
         async with self._lock:
-            return await self.syncer.incremental_sync(fid, window=self.config.sync_window)
+            return await self._incremental_locked(fid)
 
     async def set_seen(self, fid: str, uid: int, seen: bool) -> None:
         async with self._lock:

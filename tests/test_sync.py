@@ -93,3 +93,85 @@ def test_changing_mailbox_during_pagination_does_not_expunge_cached_mail(syncer)
     new, gone = asyncio.run(syncer.incremental_sync("0", window=4, page=2))
     assert (new, gone) == (1, [])
     assert syncer.cache.live_mailru_ids("0") == {"10", "20", "30", "40"}
+
+
+def test_mark_all_read_refreshes_entire_cache_without_downloading_history(syncer):
+    for mid in [10, 20, 30]:
+        syncer.cache.add_message("0", str(mid), mid, 1, {"\\Deleted", "\\Flagged"}, {})
+    before = [(m.uid, m.mailru_id) for m in syncer.cache.messages("0")]
+    syncer.api.folders.return_value = [RemoteFolder("0", "INBOX", total=30, unread=0)]
+    asyncio.run(syncer.sync_folders())
+    assert syncer.cache.counts("0") == (3, 0)
+    assert all(m.flags == {"\\Seen", "\\Deleted", "\\Flagged"} for m in syncer.cache.messages("0"))
+    assert [(m.uid, m.mailru_id) for m in syncer.cache.messages("0")] == before
+    syncer.api.messages.assert_not_awaited()
+    syncer.api.download.assert_not_awaited()
+
+
+def test_partial_read_counter_change_refreshes_flags_beyond_newest_window(syncer):
+    syncer.cache.upsert_folder("0", "INBOX", "-1", "inbox", True, 3, 2)
+    for mid in [10, 20, 30]:
+        syncer.cache.add_message("0", str(mid), mid, 1, set(), {})
+    syncer.api.folders.return_value = [RemoteFolder("0", "INBOX", total=3, unread=1)]
+    newest = page([30, 20], 3)
+    newest.messages[0].unread = False
+    older = page([10], 3)
+    older.messages[0].unread = False
+    syncer.api.messages.side_effect = [newest, older]
+
+    async def run():
+        await syncer.sync_folders()
+        assert syncer.cache.get_meta("flags_dirty:0") == "1"
+        await syncer.incremental_sync("0", window=2, page=2)
+    asyncio.run(run())
+    assert syncer.cache.counts("0") == (3, 1)
+    assert syncer.cache.message_by_uid("0", 1).seen
+    assert syncer.api.messages.await_count == 2
+    assert syncer.cache.get_meta("flags_dirty:0") == "0"
+
+
+def test_periodic_refresh_detects_older_flag_changes_with_unchanged_unread_counter(syncer, monkeypatch):
+    monkeypatch.setattr("mailru_bridge.sync.time.time", lambda: 1000)
+    syncer.cache.set_meta("flags_sync:0", "1")
+    for mid in [10, 20, 30]:
+        syncer.cache.add_message("0", str(mid), mid, 1, set(), {})
+    newest = page([30, 20], 3)
+    older = page([10], 3)
+    older.messages[0].unread = False
+    syncer.api.messages.side_effect = [newest, older]
+    asyncio.run(syncer.incremental_sync("0", window=2, page=2))
+    assert syncer.cache.message_by_uid("0", 1).seen
+    assert syncer.api.messages.await_count == 2
+    assert syncer.cache.get_meta("flags_sync:0") == "1000"
+
+
+def test_history_refresh_reaches_oldest_cached_message_after_new_arrivals(syncer):
+    syncer.cache.add_message("0", "10", 10, 1, {"\\Deleted"}, {})
+    syncer.cache.set_meta("flags_dirty:0", "1")
+    old = page([10], 5)
+    old.messages[0].unread = False
+    syncer.api.messages.side_effect = [page([50, 40], 5), page([30, 20], 5), old]
+    new, gone = asyncio.run(syncer.incremental_sync("0", window=2, page=2))
+    assert (new, gone) == (4, [])
+    assert syncer.cache.message_by_uid("0", 1).flags == {"\\Seen", "\\Deleted"}
+    assert syncer.cache.message_by_uid("0", 1).mailru_id == "10"
+    assert syncer.api.messages.await_count == 3
+
+
+def test_routine_sync_keeps_small_window_before_full_refresh_is_due(syncer, monkeypatch):
+    monkeypatch.setattr("mailru_bridge.sync.time.time", lambda: 1010)
+    syncer.cache.set_meta("flags_sync:0", "1000")
+    for mid in [10, 20, 30]:
+        syncer.cache.add_message("0", str(mid), mid, 1, set(), {})
+    syncer.api.messages.return_value = page([30, 20], 10)
+    asyncio.run(syncer.incremental_sync("0", window=2, page=2))
+    syncer.api.messages.assert_awaited_once_with("0", offset=0, limit=2)
+
+
+def test_unstable_history_scan_keeps_pending_flag_refresh(syncer):
+    for mid in [10, 20, 30]:
+        syncer.cache.add_message("0", str(mid), mid, 1, set(), {})
+    syncer.cache.set_meta("flags_dirty:0", "1")
+    syncer.api.messages.side_effect = [page([30, 20], 3), page([10], 4)]
+    asyncio.run(syncer.incremental_sync("0", window=2, page=2))
+    assert syncer.cache.get_meta("flags_dirty:0") == "1"

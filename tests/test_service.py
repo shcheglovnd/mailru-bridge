@@ -49,3 +49,27 @@ def test_listener_failure_cancels_other_tasks_before_closing_resources(tmp_path)
         assert cancelled.is_set()
         assert all(task is asyncio.current_task() or task.done() for task in asyncio.all_tasks())
     asyncio.run(run())
+
+
+def test_background_poll_refreshes_all_cached_folders_and_continues_after_one_failure(tmp_path):
+    async def run():
+        cache = Cache(tmp_path / "cache.sqlite3")
+        for fid, name in [("0", "INBOX"), ("17", "Finance"), ("1", "Utilities"), ("9", "Unopened")]:
+            cache.upsert_folder(fid, name, "-1", "user", False, 0, 0)
+            if fid != "9":
+                cache.set_last_sync(fid, 100)
+        service = BridgeService(Account("user@example.com"), BridgeConfig(), cache)
+        service.imap.sync_folders = AsyncMock()
+        async def incremental(fid):
+            if fid == "1":
+                raise RuntimeError("temporary failure")
+            return 0, []
+        service.imap.incremental = AsyncMock(side_effect=incremental)
+        try:
+            await service._poll_cached_folders()
+            service.imap.sync_folders.assert_awaited_once()
+            assert {call.args[0] for call in service.imap.incremental.await_args_list} == {"0", "1", "17"}
+        finally:
+            await service.api.aclose()
+            cache.close()
+    asyncio.run(run())

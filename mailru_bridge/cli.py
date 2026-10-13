@@ -122,6 +122,8 @@ def _setup(args: argparse.Namespace) -> int:
         cfg.initial_depth = args.initial_depth
     if args.sync_window is not None:
         cfg.sync_window = args.sync_window
+    if args.flag_refresh is not None:
+        cfg.flag_refresh_seconds = args.flag_refresh
     if args.alert_command is not None:
         cfg.alert_command = args.alert_command
     if not cfg.password_hash or args.password:
@@ -203,6 +205,8 @@ def main(argv: list[str] | None = None) -> int:
                          help="newest messages to sync per folder on first open (default 2000)")
     p_setup.add_argument("--sync-window", type=int,
                          help="newest messages re-checked each incremental poll (default 200)")
+    p_setup.add_argument("--flag-refresh", type=int,
+                         help="periodic refresh of flags across cached history, seconds (default 900)")
     p_setup.add_argument("--alert-command",
                          help="command run (message appended) when a re-login is needed; "
                               "pass '' to disable")

@@ -235,3 +235,20 @@ def test_imaplib_over_local_socket(connection):
         async with listener:
             await asyncio.wait_for(asyncio.to_thread(client, listener.sockets[0].getsockname()[1]), 10)
     asyncio.run(run())
+
+
+def test_idle_poll_reports_read_updates_to_messages_older_than_newest_window(connection):
+    select(connection, [set() for _ in range(205)])
+    # Folder-list reconciliation repaired the old messages before this client's IDLE tick.
+    connection.s.cache.mark_all_seen("0")
+    asyncio.run(connection.poll_selected())
+    assert b"1 FETCH (UID 1 FLAGS (\\Seen))" in connection.writer.data
+    assert b"205 FETCH (UID 205 FLAGS (\\Seen))" in connection.writer.data
+    assert len(connection.snapshot) == 205
+
+
+def test_shallow_status_cache_keeps_refreshing_without_select(connection):
+    connection.s.cache.set_meta("deep:9", "0")
+    connection.s.cache.set_last_sync("9", 100)
+    asyncio.run(connection.s.sync_folder_quietly("9"))
+    connection.s.syncer.incremental_sync.assert_awaited_once_with("9", window=connection.s.config.sync_window)
