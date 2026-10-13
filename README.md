@@ -72,7 +72,8 @@ Use your Mail.ru address as the username and the **bridge** password you just se
 
 TLS is **implicit TLS** from connection start; select SSL/TLS in the client.
 Let the **server manage Sent** (the API files sent mail in Sent itself); disable the client's
-additional Sent copy. Draft APPEND saves through `messages/draft`, including attachments, without
+additional Sent copy. See [Thunderbird setup and compatibility](docs/thunderbird.md) for desktop
+settings, offline downloads, and API limitations. Draft APPEND saves through `messages/draft`, including attachments, without
 dispatching mail. The first time
 a large folder is opened the bridge syncs its newest messages (configurable depth) into a local
 cache; later opens are served from the cache and only new mail is fetched.
@@ -99,6 +100,11 @@ Read-only `EXAMINE` sessions cannot modify mail.
 response. Folder names preserve case; only `INBOX` is case-insensitive. Moves and deletes-to-Trash
 update the destination cache immediately and preserve downloaded sources. Draft refreshes discard
 old cached bodies so edits in the web client appear on the next fetch, without changing the UID.
+UIDPLUS supplies draft APPENDUID and MOVE COPYUID mappings, plus scoped UID EXPUNGE. Draft APPEND
+accepts client flags/internal dates and literal mailbox names. Tags and client reply/forward marks
+persist in the bridge cache across refreshes, restarts, and bridge moves. SMTP replies resolve their
+In-Reply-To against cached headers to pass Mail.ru's reply reference. Unsupported PGP/MIME and
+S/MIME submission is rejected before sending; incoming raw-source fetching remains available.
 
 ## Development checks
 

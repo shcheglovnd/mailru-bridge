@@ -60,7 +60,12 @@
       mailbox case/hierarchy handling, deselection after failed SELECT, immediate destination-cache
       moves, edited-draft invalidation, cached header metadata, missing-message tolerance, MIME section
       NIL responses and RFC 2231 attachment filenames. Mail API list metadata requests plain text.
-- [ ] Packaging and client setup docs for Thunderbird / FairEmail.
+- [x] Thunderbird compatibility: UIDPLUS draft acknowledgements and move mappings, client flags
+      and internal dates on APPEND, persistent local tags/reply/forward indicators, serialized
+      concurrent moves, cached original-message references on SMTP replies, and explicit protected
+      MIME submission errors. Socket replays cover header sync, chunks and draft replacement.
+- [x] [Thunderbird setup and compatibility notes](thunderbird.md).
+- [ ] Packaging and FairEmail setup docs.
 
 ### Resolved questions
 - Raw RFC822 source exists (`messages/message/download`) — no need to rebuild from JSON.

@@ -20,7 +20,8 @@ import logging
 import re
 import ssl
 import time
-from email.utils import formatdate
+from datetime import datetime
+from email.utils import getaddresses
 
 from .api import ApiError, AuthExpired, MailruApi, NotFound
 from .cache import Cache, CachedMessage
@@ -28,7 +29,7 @@ from .config import BridgeConfig
 from .imap_struct import bodystructure, envelope, envelope_from_meta
 from .imap_utf7 import decode as u7decode, encode as u7encode
 from .mime import Message as MimeMessage
-from .outgoing import build_draft
+from .outgoing import UnsupportedMessage, build_draft
 from .search import UnsupportedCharset, compile_search
 from .sync import Syncer
 
@@ -486,9 +487,12 @@ class ImapConnection:
         exists, unseen = self.s.cache.counts(fid)
         await self.untagged(f"{exists} EXISTS")
         await self.untagged("0 RECENT")
-        await self.untagged(r'FLAGS (\Seen \Flagged \Answered \Deleted \Draft $Forwarded)')
+        available = {"\\Seen", "\\Flagged", "\\Answered", "\\Deleted", "\\Draft", "$Forwarded"}
+        for cm in self.s.cache.messages(fid):
+            available.update(cm.flags)
+        await self.untagged("FLAGS (" + " ".join(sorted(available)) + ")")
         await self.untagged('OK [PERMANENTFLAGS ()] read-only' if readonly else
-                            r'OK [PERMANENTFLAGS (\Seen \Flagged \Answered \Deleted $Forwarded)] limited')
+                            r'OK [PERMANENTFLAGS (\Seen \Flagged \Answered \Deleted \Draft $Forwarded \*)] writable')
         await self.untagged(f"OK [UIDVALIDITY {folder['uidvalidity']}] validity")
         await self.untagged(f"OK [UIDNEXT {folder['uidnext']}] next")
         if unseen:
@@ -708,10 +712,14 @@ class ImapConnection:
         if need_raw:
             try:
                 raw = await self.s.syncer.ensure_raw(self.selected, uid)
-            except NotFound:
+            except (NotFound, KeyError):
+                if self.s.cache.message_by_uid(self.selected, uid) is not None:
+                    raise
                 return None
             mime = MimeMessage(raw)
             cm = self.s.cache.message_by_uid(self.selected, uid)  # size may have been corrected
+            if cm is None:
+                return None
 
         if by_uid and not any(it.upper() == "UID" for it in items):
             items = items + ["UID"]
@@ -784,12 +792,8 @@ class ImapConnection:
             return True
         seqset = m.group(1).decode("latin-1")
         op = m.group(2).decode("latin-1").upper()
-        canonical = {f.lower(): f for f in ("\\Seen", "\\Flagged", "\\Answered", "\\Deleted", "$Forwarded")}
         requested = m.group(3).decode("latin-1").split()
-        if any(f.lower() not in canonical for f in requested):
-            await self.tagged(tag, "NO", "unsupported flag")
-            return True
-        flags = {canonical[f.lower()] for f in requested}
+        flags = _canonical_flags(requested)
         silent = "SILENT" in op
         mode = "+" if op.startswith("+") else "-" if op.startswith("-") else "="
         ranges = self._ranges(seqset, by_uid)
@@ -824,14 +828,22 @@ class ImapConnection:
             return True
         ranges = self._ranges(_astr(args[0]), by_uid)
         targets = self._resolve(ranges, by_uid)
-        ids = [self.s.cache.message_by_uid(self.selected, uid).mailru_id for _, uid in targets
-               if self.s.cache.message_by_uid(self.selected, uid)]
-        if ids:
-            uids = [uid for _, uid in targets]
-            async with self.s._lock:
+        mapping = {}
+        async with self.s._lock:
+            # Resolve inside the mutation lock: a second client's stale snapshot must not
+            # move a message again after the first client already moved it elsewhere.
+            current = [(uid, self.s.cache.message_by_uid(self.selected, uid)) for _, uid in targets]
+            ids = [cm.mailru_id for _, cm in current if cm is not None]
+            uids = [uid for uid, cm in current if cm is not None]
+            if ids:
                 await self.s.api.move(ids, dest)
-                self.s.cache.move_messages(self.selected, dest, uids)
-            exp_set = set(uids)
+                mapping = self.s.cache.move_messages(self.selected, dest, uids)
+                validity = self.s.cache.folder(dest)["uidvalidity"]
+        if mapping:
+            source_set = ",".join(str(u) for u in mapping)
+            dest_set = ",".join(str(u) for u in mapping.values())
+            await self.untagged(f"OK [COPYUID {validity} {source_set} {dest_set}] moved")
+            exp_set = set(mapping)
             for seq in range(len(self.snapshot), 0, -1):
                 if self.snapshot[seq - 1] in exp_set:
                     await self.untagged(f"{seq} EXPUNGE")
@@ -929,20 +941,31 @@ class ImapConnection:
     async def cmd_append(self, tag, rest, tokens) -> bool:
         # APPEND <mailbox> [(flags)] ["date"] {literal}
         args = _split_astrings(tokens)
-        if not args:
+        if not 2 <= len(args) <= 4 or not isinstance(args[-1], bytes):
             await self.tagged(tag, "BAD", "APPEND syntax")
             return True
+        options = args[1:-1]
+        flags = _canonical_flags(options.pop(0)) if options and isinstance(options[0], list) else set()
+        date = int(time.time())
+        if options:
+            if len(options) != 1 or not isinstance(options[0], str):
+                raise ValueError("invalid APPEND options")
+            date = int(datetime.strptime(options[0], "%d-%b-%Y %H:%M:%S %z").timestamp())
         name = _mailbox_name(args[0])
         fid = self.s.tree.id_for(name)
-        literal = next((data for kind, data in tokens if kind == "l"), None)
+        literal = args[-1]
         if fid == "500000":
             await self.tagged(tag, "NO", "Sent is server-managed; disable client Sent APPEND")
             return True
-        if fid == "500001" and literal:  # Drafts: create a draft from the message
+        if fid == "500001":  # Drafts: create a draft from the message
             try:
-                await self.s.save_draft(literal)
-                await self.s.sync_folder_quietly("500001")
-                await self.tagged(tag, "OK", "APPEND (draft) completed")
+                uid = await self.s.save_draft(literal, flags, date)
+                if self.selected == fid:
+                    await self._append_cached_arrivals()
+                code = f"[APPENDUID {self.s.cache.folder(fid)['uidvalidity']} {uid}] " if uid is not None else ""
+                await self.tagged(tag, "OK", code + "APPEND (draft) completed")
+            except UnsupportedMessage as exc:
+                await self.tagged(tag, "NO", str(exc))
             except ApiError as exc:
                 await self.tagged(tag, "NO", f"APPEND failed: {exc}")
             return True
@@ -1018,6 +1041,22 @@ def _astr(value) -> str:
 
 def _mailbox_name(value) -> str:
     return u7decode(_astr(value))
+
+
+def _canonical_flags(values) -> set[str]:
+    """IMAP keywords are case-insensitive atoms; only defined system flags are settable."""
+    system = {f.lower(): f for f in ("\\Seen", "\\Flagged", "\\Answered", "\\Deleted", "\\Draft", "$Forwarded")}
+    out = set()
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError("invalid flag")
+        flag = system.get(value.lower())
+        if flag is None:
+            if not value.isascii() or not re.fullmatch(r'[^\x00-\x20\x7f(){%*"\\\]]+', value):
+                raise ValueError("unsupported or invalid flag")
+            flag = value.lower()
+        out.add(flag)
+    return out
 
 
 def _split_astrings(tokens: list[tuple[str, bytes]]) -> list:
@@ -1193,7 +1232,7 @@ class ImapServer:
         self._folders_synced_at = 0.0
 
     def capabilities(self) -> str:
-        caps = ["IMAP4rev1", "AUTH=PLAIN", "SASL-IR", "IDLE", "MOVE", "LITERAL+", "NAMESPACE", "ID", "UNSELECT"]
+        caps = ["IMAP4rev1", "AUTH=PLAIN", "SASL-IR", "IDLE", "MOVE", "UIDPLUS", "LITERAL+", "NAMESPACE", "ID", "UNSELECT"]
         return " ".join(caps)
 
     def has_children(self, fid: str) -> bool:
@@ -1287,11 +1326,47 @@ class ImapServer:
                 await self.api.mark(fid, flag=[mid])
             elif was_flag and not now_flag:
                 await self.api.mark(fid, unflag=[mid])
-            self.cache.update_flags(fid, uid, target)
+            self.cache.update_client_flags(fid, uid, target)
             return target
 
-    async def save_draft(self, raw: bytes) -> None:
-        await self.api.save_draft(build_draft(raw, self.account.email))
+    async def save_draft(self, raw: bytes, flags: set[str], date: int) -> int | None:
+        from .mime import decoded_headers, normalize
+
+        raw = normalize(raw)
+        msg = build_draft(raw, self.account.email)
+        msg.reply_to_id = self.cache.mailru_id_for_message_id(msg.in_reply_to)
+        async with self._lock:
+            result = await self.api.save_draft(msg)
+            mid = result.get("id") if isinstance(result, dict) else None
+            if not isinstance(mid, (str, int)) or isinstance(mid, bool) or not str(mid):
+                # The save already succeeded: never report failure and invite a duplicate retry.
+                log.warning("draft saved without a message id; APPENDUID unavailable")
+                try:
+                    await self._incremental_locked("500001")
+                except ApiError:
+                    log.warning("post-save draft refresh failed")
+                return None
+            headers = decoded_headers(raw)
+            meta = {"subject": msg.subject, "headers": headers, "attachments": bool(msg.attachments)}
+            for field in ("from", "to", "cc", "bcc"):
+                meta[field] = getaddresses(headers.get(field, []))
+            uid = self.cache.add_message("500001", str(mid), date, len(raw), {"\\Draft"}, meta)
+            # Cache the exact client revision until the next authoritative draft refresh.
+            self.cache.set_raw("500001", uid, raw)
+            if "\\Seen" in flags:
+                try:
+                    await self.api.mark("500001", read=[str(mid)])
+                except ApiError:
+                    log.warning("draft saved, but read mark failed")
+                    flags = flags - {"\\Seen"}
+            if "\\Flagged" in flags:
+                try:
+                    await self.api.mark("500001", flag=[str(mid)])
+                except ApiError:
+                    log.warning("draft saved, but star mark failed")
+                    flags = flags - {"\\Flagged"}
+            self.cache.update_client_flags("500001", uid, flags | {"\\Draft"})
+            return uid
 
     async def serve(self) -> None:
         await self.sync_folders()

@@ -18,6 +18,7 @@ import ssl
 
 from .api import ApiError, MailruApi
 from .config import BridgeConfig
+from .outgoing import UnsupportedMessage
 
 log = logging.getLogger(__name__)
 
@@ -272,6 +273,8 @@ class SmtpSession:
             raw = b"".join(chunks)
             await self.s.send_message(raw, self.mail_from, list(self.rcpts))
             await self.send("250 OK message accepted")
+        except UnsupportedMessage as exc:
+            await self.send(f"554 5.6.0 {exc}")
         except ApiError as exc:
             log.warning("send failed: %s", exc)
             await self.send("451 upstream submission failed")

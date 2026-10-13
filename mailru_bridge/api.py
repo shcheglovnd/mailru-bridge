@@ -176,6 +176,7 @@ class OutgoingMessage:
     attachments: list[Attachment] = field(default_factory=list)
     reply_to_id: str | None = None  # Mail.ru id of the message this answers
     forward_of_id: str | None = None
+    in_reply_to: str | None = None  # RFC Message-ID; resolved through the bridge's cached headers
     priority: int = 3
     receipt: bool = False
 

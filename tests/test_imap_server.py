@@ -40,6 +40,7 @@ def connection(tmp_path):
     api = SimpleNamespace(**{name: AsyncMock() for name in
                             ("move", "remove", "mark", "send", "save_draft", "create_folder",
                              "delete_folder", "rename_folder")})
+    api.save_draft.return_value = {"id": "1000"}
     syncer = SimpleNamespace(incremental_sync=AsyncMock(return_value=(0, [])),
                              initial_sync=AsyncMock(), sync_folders=AsyncMock())
     server = ImapServer(Account("user@example.com"), api, cache, syncer, BridgeConfig())
@@ -125,6 +126,194 @@ def test_draft_append_never_sends_and_preserves_attachments(connection):
     assert outgoing.attachments[0].content == b"FILE"
 
 
+def test_thunderbird_draft_append_returns_uid_and_preserves_flags_and_internaldate(connection):
+    connection.authed = True
+    raw = b"Message-ID: <draft@example.com>\r\nSubject: unsent\r\n\r\nbody"
+    dispatch(connection, b'APPEND Drafts (\\Seen \\Draft $label1) "12-Oct-2026 17:00:00 -0500" ',
+             [("l", raw), ("t", b"")])
+    validity = connection.s.cache.folder("500001")["uidvalidity"]
+    assert f"A1 OK [APPENDUID {validity} 1]".encode() in connection.writer.data
+    draft = connection.s.cache.message_by_uid("500001", 1)
+    assert draft.flags == {"\\Seen", "\\Draft", "$label1"}
+    assert draft.date == 1791842400  # supplied date, converted to UTC
+    connection.s.api.mark.assert_awaited_once_with("500001", read=["1000"])
+    connection.selected = "500001"
+    connection._rebuild_snapshot()
+    dispatch(connection, b"UID SEARCH UNDELETED HEADER Message-ID <draft@example.com>")
+    assert b"* SEARCH 1\r\n" in connection.writer.data
+
+
+def test_draft_append_uses_last_literal_when_mailbox_itself_is_literal(connection):
+    connection.authed = True
+    raw = b"Subject: actual draft\r\n\r\nbody"
+    dispatch(connection, b"APPEND ", [("l", b"Drafts"), ("t", b" (\\Draft) "),
+                                      ("l", raw), ("t", b"")])
+    assert connection.s.api.save_draft.await_args.args[0].subject == "actual draft"
+    assert connection.s.cache.get_raw("500001", 1) == raw
+
+
+def test_draft_followup_read_mark_failure_does_not_report_failed_save(connection):
+    from mailru_bridge.api import ApiError
+    connection.authed = True
+    connection.s.api.mark.side_effect = ApiError("temporary failure")
+    dispatch(connection, b"APPEND Drafts (\\Seen \\Draft) ",
+             [("l", b"Subject: saved\r\n\r\nbody"), ("t", b"")])
+    assert b"A1 OK [APPENDUID " in connection.writer.data
+    assert "\\Seen" not in connection.s.cache.message_by_uid("500001", 1).flags
+    connection.s.api.save_draft.assert_awaited_once()
+
+
+def test_successful_draft_save_without_remote_id_is_not_retried_or_guessed(connection):
+    connection.authed = True
+    connection.s.api.save_draft.return_value = {}
+    dispatch(connection, b"APPEND Drafts ", [("l", b"Subject: saved\r\n\r\nbody"), ("t", b"")])
+    assert b"A1 OK APPEND (draft) completed" in connection.writer.data
+    assert b"APPENDUID" not in connection.writer.data
+    connection.s.api.save_draft.assert_awaited_once()
+    connection.s.syncer.incremental_sync.assert_awaited_once()
+    assert connection.s.cache.messages("500001") == []
+
+
+def test_protected_draft_is_rejected_without_saving_or_sending(connection):
+    connection.authed = True
+    dispatch(connection, b"APPEND Drafts ",
+             [("l", b"Content-Type: multipart/encrypted\r\n\r\nprotected"), ("t", b"")])
+    assert b"A1 NO PGP/MIME and S/MIME" in connection.writer.data
+    connection.s.api.save_draft.assert_not_awaited()
+    connection.s.api.send.assert_not_awaited()
+
+
+@pytest.mark.parametrize("options", [b"(\\Recent) ", b"(\\Unknown) ", b'"not-a-date" ', b"(tag) (other) "])
+def test_invalid_append_options_rejected_before_saving(connection, options):
+    connection.authed = True
+    with pytest.raises(ValueError):
+        dispatch(connection, b"APPEND Drafts " + options,
+                 [("l", b"Subject: unsent\r\n\r\nbody"), ("t", b"")])
+    connection.s.api.save_draft.assert_not_awaited()
+
+
+def test_move_returns_exact_uid_mapping_before_expunge(connection):
+    select(connection, [set(), set(), set()])
+    connection.s.cache.add_message("9", "other", 0, 1, set(), {})
+    connection.s.cache.forget("0", [2])  # stale selected snapshot; skip vanished UID
+    dispatch(connection, b'UID MOVE 1:3 "' + encode("Письма") + b'"')
+    validity = connection.s.cache.folder("9")["uidvalidity"]
+    code = f"* OK [COPYUID {validity} 1,3 2,3] moved\r\n".encode()
+    assert code in connection.writer.data
+    assert connection.writer.data.index(code) < connection.writer.data.index(b"EXPUNGE")
+    assert [m.mailru_id for m in connection.s.cache.messages("9")] == ["other", "100", "300"]
+
+
+def test_two_clients_moving_same_message_only_first_calls_api(connection):
+    async def run():
+        select(connection, [set()])
+        second = ImapConnection(connection.s, None, Writer())
+        second.authed, second.selected, second.snapshot = True, "0", [1]
+        started, finish = asyncio.Event(), asyncio.Event()
+        async def move(ids, destination):
+            started.set()
+            await finish.wait()
+        connection.s.api.move.side_effect = move
+        first = asyncio.create_task(connection.dispatch([("t", b"A1 UID MOVE 1 Sent")]))
+        await started.wait()
+        other = asyncio.create_task(second.dispatch([("t", b"A2 UID MOVE 1 Drafts")]))
+        await asyncio.sleep(0)
+        finish.set()
+        await asyncio.gather(first, other)
+        connection.s.api.move.assert_awaited_once_with(["100"], "500000")
+        assert connection.s.cache.uid_for("500000", "100") == 1
+        assert connection.s.cache.messages("500001") == []
+    asyncio.run(run())
+
+
+def test_thunderbird_tags_and_reply_markers_survive_remote_sync(connection):
+    select(connection, [set()])
+    dispatch(connection, b"UID STORE 1 +FLAGS.SILENT (\\Answered $Forwarded $LABEL1 customtag Junk)")
+    connection.s.cache.update_remote_messages_batch("0", [("100", 1, 1, {"\\Seen"}, {})])
+    dispatch(connection, b"UID FETCH 1 FLAGS")
+    flags = connection.s.cache.message_by_uid("0", 1).flags
+    assert flags == {"\\Seen", "\\Answered", "$Forwarded", "$label1", "customtag", "junk"}
+    dispatch(connection, b"UID STORE 1 -FLAGS.SILENT ($LABEL1 CUSTOMTAG)")
+    dispatch(connection, b"UID SEARCH KEYWORD junk")
+    assert b"* SEARCH 1\r\n" in connection.writer.data
+    connection.s.api.mark.assert_not_awaited()
+
+
+def test_thunderbird_sync_chunks_move_and_repeated_draft_saves_over_socket(connection):
+    from mailru_bridge.sync import Syncer
+    import re
+
+    async def run():
+        select(connection, [set()])
+        raw = (b"From: sender@example.com\r\nTo: user@example.com\r\n"
+               b"Message-ID: <original@example.com>\r\nSubject: original\r\n"
+               b"References: <earlier@example.com>\r\nContent-Type: text/plain\r\n\r\n"
+               + b"chunked body\r\n" * 700)
+        connection.s.cache.set_raw("0", 1, raw)
+        connection.s.syncer.ensure_raw = Syncer(connection.s.api, connection.s.cache).ensure_raw
+        connection.s.config.check_login = lambda user, password: True
+        connection.s.api.save_draft.side_effect = [{"id": "1000"}, {"id": "2000"}]
+        listener = await asyncio.start_server(connection.s._handle, "127.0.0.1", 0)
+        async with listener:
+            reader, writer = await asyncio.open_connection("127.0.0.1", listener.sockets[0].getsockname()[1])
+            assert b"UIDPLUS" in await reader.readline()
+            async def command(tag, data):
+                writer.write(tag + b" " + data + b"\r\n")
+                await writer.drain()
+                lines, literals = [], []
+                while True:
+                    line = await asyncio.wait_for(reader.readline(), 5)
+                    assert line
+                    lines.append(line)
+                    match = re.search(rb"\{(\d+)\}\r\n$", line)
+                    if match:
+                        literals.append(await reader.readexactly(int(match[1])))
+                    if line.startswith(tag + b" "):
+                        assert line.startswith(tag + b" OK "), line
+                        return b"".join(lines), literals
+            try:
+                await command(b"a", b'LOGIN "user@example.com" "test-password"')
+                await command(b"b", b"NAMESPACE")
+                listed, _ = await command(b"c", b'LSUB "" "*"')
+                assert b'\\Drafts) "/" "Drafts"' in listed
+                selected, _ = await command(b"d", b"SELECT INBOX")
+                assert b"\\*" in selected
+                headers = (b"From To Cc Bcc Subject Date Message-ID Priority X-Priority References "
+                           b"Newsgroups In-Reply-To Content-Type Reply-To Received")
+                response, parts = await command(b"e", b"UID FETCH 1:* (UID RFC822.SIZE FLAGS BODY.PEEK[HEADER.FIELDS ("
+                                                      + headers + b")])")
+                assert b"References: <earlier@example.com>" in parts[0]
+                assert f"RFC822.SIZE {len(raw)}".encode() in response
+                await command(b"f", b"UID STORE 1 +FLAGS.SILENT ($label1 \\Answered $Forwarded)")
+                for tag, start, length in [(b"g", 0, 4096), (b"h", 4096, 4096), (b"i", len(raw), 4096)]:
+                    response, parts = await command(tag, f"UID FETCH 1 (UID RFC822.SIZE BODY.PEEK[]<{start}.{length}>)".encode())
+                    assert parts == [raw[start:start + length]]
+                    assert f"BODY[]<{start}>".encode() in response
+                moved, _ = await command(b"j", b"UID MOVE 1 Sent")
+                assert b"COPYUID" in moved and b"1 EXPUNGE" in moved
+                await command(b"k", b"SELECT Drafts")
+                for tag, uid in [(b"l", 1), (b"m", 2)]:
+                    draft = (b"To: recipient@example.com\r\nIn-Reply-To: <original@example.com>\r\n"
+                             b"Message-ID: <draft@example.com>\r\nX-Mozilla-Draft-Info: internal/draft; vcard=0\r\n"
+                             b"Subject: unsent revision " + str(uid).encode() + b"\r\n\r\nbody")
+                    response, _ = await command(tag, b'APPEND "Drafts" (\\Seen \\Draft) "12-Oct-2026 17:00:00 -0500" {'
+                                                  + str(len(draft)).encode() + b"+}\r\n" + draft)
+                    assert f" {uid}] APPEND (draft) completed".encode() in response
+                    assert b"APPENDUID" in response and f"* {uid} EXISTS".encode() in response
+                assert connection.s.api.save_draft.await_args.args[0].reply_to_id == "100"
+                await command(b"n", b"UID STORE 1 +FLAGS.SILENT (\\Deleted)")
+                await command(b"o", b"UID EXPUNGE 1")
+                response, _ = await command(b"p", b"UID SEARCH UNDELETED")
+                assert b"* SEARCH 2\r\n" in response
+                assert connection.s.cache.live_mailru_ids("500001") == {"2000"}
+                connection.s.api.send.assert_not_awaited()
+                await command(b"q", b"LOGOUT")
+            finally:
+                writer.close()
+                await writer.wait_closed()
+    asyncio.run(run())
+
+
 def test_sent_append_is_not_acknowledged_without_storing(connection):
     connection.authed = True
     dispatch(connection, b"APPEND Sent ", [("l", b"Subject: s\r\n\r\nbody"), ("t", b"")])
@@ -150,7 +339,7 @@ def test_modified_utf7_select_and_namespace(connection):
     assert connection.selected == "9"
     dispatch(connection, b"NAMESPACE")
     assert b'NAMESPACE (("" "/")) NIL NIL' in connection.writer.data
-    assert "UIDPLUS" not in connection.s.capabilities()
+    assert "UIDPLUS" in connection.s.capabilities()
 
 
 @pytest.mark.parametrize("criteria, expected", [

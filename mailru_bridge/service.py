@@ -68,6 +68,7 @@ class BridgeService:
 
     async def _send_message(self, raw: bytes, mail_from: str, rcpts: list[str]) -> None:
         msg = build_outgoing(raw, mail_from, rcpts, self.account.email)
+        msg.reply_to_id = self.cache.mailru_id_for_message_id(msg.in_reply_to)
         log.info("sending message: %d recipient(s), %d attachment(s)", len(rcpts), len(msg.attachments))
         await self.api.send(msg)
         # Refresh Sent so the client sees the server-filed copy.

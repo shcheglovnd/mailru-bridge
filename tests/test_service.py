@@ -73,3 +73,28 @@ def test_background_poll_refreshes_all_cached_folders_and_continues_after_one_fa
             await service.api.aclose()
             cache.close()
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("message_id, expected", [("<original@example.com>", "100"),
+                                                 ("<unknown@example.com>", None)])
+def test_smtp_reply_passes_cached_remote_reference_to_api(tmp_path, message_id, expected):
+    async def run():
+        cache = Cache(tmp_path / "cache.sqlite3")
+        cache.upsert_folder("0", "INBOX", "-1", "inbox", True, 0, 0)
+        cache.add_message("0", "100", 1, 1, set(), {})
+        cache.set_raw("0", 1, b"Message-ID: <original@example.com>\r\n\r\noriginal")
+        service = BridgeService(Account("user@example.com"), BridgeConfig(), cache)
+        service.api.send = AsyncMock()
+        service.imap.incremental = AsyncMock()
+        raw = (f"From: user@example.com\r\nTo: recipient@example.com\r\n"
+               f"In-Reply-To: {message_id}\r\nSubject: Re: original\r\n\r\nreply").encode()
+        try:
+            await service._send_message(raw, "user@example.com", ["recipient@example.com"])
+            outgoing = service.api.send.await_args.args[0]
+            assert outgoing.reply_to_id == expected
+            assert outgoing.in_reply_to == message_id
+            service.imap.incremental.assert_awaited_once_with("500000")
+        finally:
+            await service.api.aclose()
+            cache.close()
+    asyncio.run(run())

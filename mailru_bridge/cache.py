@@ -57,7 +57,22 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 
 # Flags controlled by Mail.ru; all other flags (notably \Deleted) are local state.
 REMOTE_FLAGS = {"\\Seen", "\\Flagged", "\\Answered", "\\Draft", "$Forwarded"}
+# The marks endpoint only writes Seen/Flagged. Client changes to the other remote
+# indicators need explicit local overrides, including removals, across remote refreshes.
+LOCAL_OVERRIDES = {"\\Answered", "\\Draft", "$Forwarded"}
 MESSAGE_COLUMNS = "folder_id,uid,mailru_id,date,size,flags,deleted,meta"
+
+
+def _merge_remote_flags(remote: set[str], local: set[str], meta: dict) -> set[str]:
+    flags = remote | (local - REMOTE_FLAGS)
+    overrides = meta.get("flag_overrides", {})
+    for flag in LOCAL_OVERRIDES:
+        if flag in overrides:
+            if overrides[flag]:
+                flags.add(flag)
+            else:
+                flags.discard(flag)
+    return flags
 
 
 @dataclass
@@ -166,16 +181,17 @@ class Cache:
         """Assign and return a UID for a newly seen message (or the existing one)."""
         with self._lock, self._conn:
             existing = self._conn.execute(
-                "SELECT uid,flags FROM messages WHERE folder_id=? AND mailru_id=?", (fid, mailru_id)
+                "SELECT uid,flags,meta FROM messages WHERE folder_id=? AND mailru_id=?", (fid, mailru_id)
             ).fetchone()
             if existing:
                 # refresh flags/meta/size; keep the uid
+                merged_meta = json.loads(existing["meta"] or "{}") | meta
                 self._conn.execute(
                     "UPDATE messages SET date=?,size=CASE WHEN raw IS NULL THEN ? ELSE size END,"
                     "flags=?,meta=?,deleted=0 "
                     "WHERE folder_id=? AND mailru_id=?",
-                    (date, size, _flags_to_text(flags | (_text_to_flags(existing["flags"]) - REMOTE_FLAGS)),
-                     json.dumps(meta, ensure_ascii=False),
+                    (date, size, _flags_to_text(_merge_remote_flags(flags, _text_to_flags(existing["flags"]), merged_meta)),
+                     json.dumps(merged_meta, ensure_ascii=False),
                      fid, mailru_id),
                 )
                 self._conn.commit()
@@ -236,17 +252,31 @@ class Cache:
         with self._lock:
             cm = self.message_by_uid(fid, uid)
             if cm is not None:
-                self.update_flags(fid, uid, flags | (cm.flags - REMOTE_FLAGS))
+                self.update_flags(fid, uid, _merge_remote_flags(flags, cm.flags, cm.meta))
+
+    def update_client_flags(self, fid: str, uid: int, flags: set[str]) -> None:
+        """Persist client-only indicators without letting a later summary overwrite them."""
+        with self._lock, self._conn:
+            cm = self.message_by_uid(fid, uid)
+            if cm is None:
+                return
+            overrides = dict(cm.meta.get("flag_overrides", {}))
+            for flag in LOCAL_OVERRIDES & (cm.flags ^ flags):
+                overrides[flag] = flag in flags
+            cm.meta["flag_overrides"] = overrides
+            self._conn.execute("UPDATE messages SET flags=?,meta=? WHERE folder_id=? AND uid=?",
+                               (_flags_to_text(flags), json.dumps(cm.meta, ensure_ascii=False), fid, uid))
 
     def update_remote_flags_batch(self, fid: str, flags_by_id: dict[str, set[str]]) -> None:
         """Refresh remote flags in one transaction while retaining local deletion marks."""
         with self._lock, self._conn:
             updates = []
             for row in self._conn.execute(
-                    "SELECT uid,mailru_id,flags FROM messages WHERE folder_id=?", (fid,)):
+                    "SELECT uid,mailru_id,flags,meta FROM messages WHERE folder_id=?", (fid,)):
                 remote = flags_by_id.get(row["mailru_id"])
                 if remote is not None:
-                    flags = _flags_to_text(remote | (_text_to_flags(row["flags"]) - REMOTE_FLAGS))
+                    flags = _flags_to_text(_merge_remote_flags(remote, _text_to_flags(row["flags"]),
+                                                             json.loads(row["meta"] or "{}")))
                     if flags != row["flags"]:
                         updates.append((flags, fid, row["uid"]))
             self._conn.executemany("UPDATE messages SET flags=? WHERE folder_id=? AND uid=?", updates)
@@ -271,7 +301,7 @@ class Cache:
                 if invalidate:
                     new_meta.pop("headers", None)
                 size = row["size"] if row["has_raw"] and not invalidate else remote_size
-                flags = _flags_to_text(remote_flags | (_text_to_flags(row["flags"]) - REMOTE_FLAGS))
+                flags = _flags_to_text(_merge_remote_flags(remote_flags, _text_to_flags(row["flags"]), new_meta))
                 encoded = json.dumps(new_meta, ensure_ascii=False)
                 if (date, size, flags, encoded) != (row["date"], row["size"], row["flags"], row["meta"]) or invalidate:
                     updates.append((date, size, flags, encoded, int(invalidate), fid, row["uid"]))
@@ -350,6 +380,10 @@ class Cache:
                     continue
                 dest_uid = self.uid_for(destination, msg.mailru_id)
                 flags = msg.flags - {"\\Deleted", "\\Draft"}
+                meta = dict(msg.meta)
+                if "flag_overrides" in meta:
+                    meta["flag_overrides"] = {k: v for k, v in meta["flag_overrides"].items() if k != "\\Draft"}
+                encoded_meta = json.dumps(meta, ensure_ascii=False)
                 if destination == "500001":
                     flags.add("\\Draft")
                 if dest_uid is None:
@@ -357,18 +391,31 @@ class Cache:
                     next_uid += 1
                     self._conn.execute(
                         "INSERT INTO messages(folder_id,uid,mailru_id,date,size,flags,deleted,meta,raw) "
-                        "SELECT ?,?,mailru_id,date,size,?,0,meta,raw FROM messages WHERE folder_id=? AND uid=?",
-                        (destination, dest_uid, _flags_to_text(flags), source, uid))
+                        "SELECT ?,?,mailru_id,date,size,?,0,?,raw FROM messages WHERE folder_id=? AND uid=?",
+                        (destination, dest_uid, _flags_to_text(flags), encoded_meta, source, uid))
                 else:
                     self._conn.execute(
-                        "UPDATE messages SET (date,size,meta,raw)="
-                        "(SELECT date,size,meta,raw FROM messages WHERE folder_id=? AND uid=?),"
-                        "flags=?,deleted=0 WHERE folder_id=? AND uid=?",
-                        (source, uid, _flags_to_text(flags), destination, dest_uid))
+                        "UPDATE messages SET (date,size,raw)="
+                        "(SELECT date,size,raw FROM messages WHERE folder_id=? AND uid=?),"
+                        "flags=?,meta=?,deleted=0 WHERE folder_id=? AND uid=?",
+                        (source, uid, _flags_to_text(flags), encoded_meta, destination, dest_uid))
                 self._conn.execute("DELETE FROM messages WHERE folder_id=? AND uid=?", (source, uid))
                 mapping[uid] = dest_uid
             self._conn.execute("UPDATE folders SET uidnext=? WHERE id=?", (next_uid, destination))
             return mapping
+
+    def mailru_id_for_message_id(self, message_id: str | None) -> str | None:
+        """Resolve an RFC Message-ID from downloaded headers, without downloading history."""
+        if not message_id:
+            return None
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT mailru_id,meta FROM messages WHERE deleted=0 "
+                "AND json_type(meta, '$.headers.\"message-id\"') = 'array'").fetchall()
+        matches = {row["mailru_id"] for row in rows
+                   if any(value.strip() == message_id.strip() for value in
+                          json.loads(row["meta"])["headers"]["message-id"])}
+        return matches.pop() if len(matches) == 1 else None
 
     def live_mailru_ids(self, fid: str) -> set[str]:
         with self._lock:

@@ -118,3 +118,22 @@ def test_listing_requests_plain_metadata_without_html_entities(account):
             "messages_total": 1, "messages": [{"id": "100", "subject": "A & B"}]}})
     assert run_api(account, handle, lambda api: api.folders())[0].name == "A & B"
     assert run_api(account, handle, lambda api: api.messages("0")).messages[0].subject == "A & B"
+
+
+def test_reply_and_draft_compose_preserve_remote_reference_and_return_message_id(account):
+    import json
+    from urllib.parse import parse_qs
+    from mailru_bridge.api import OutgoingMessage
+    requests = []
+    def handle(request):
+        requests.append(request.url.path)
+        form = parse_qs(request.content.decode())
+        assert json.loads(form["source"][0]) == {"reply": "100"}
+        assert json.loads(form["body"][0]) == {"text": "reply body"}
+        assert json.loads(form["correspondents"][0]) == {"to": "recipient@example.com"}
+        return httpx.Response(200, json={"status": 200, "body": {"id": "200"}})
+    msg = OutgoingMessage(sender="user@example.com", to=["recipient@example.com"],
+                          text="reply body", reply_to_id="100")
+    assert run_api(account, handle, lambda api: api.send(msg)) == {"id": "200"}
+    assert run_api(account, handle, lambda api: api.save_draft(msg)) == {"id": "200"}
+    assert requests == ["/api/v1/messages/send", "/api/v1/messages/draft"]

@@ -85,6 +85,26 @@ def test_truncated_data_never_submits():
     asyncio.run(run())
 
 
+def test_protected_message_is_rejected_permanently_and_next_command_is_recoverable():
+    from mailru_bridge.outgoing import build_outgoing
+    async def run():
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"Content-Type: multipart/encrypted\r\n\r\nprotected\r\n.\r\nNOOP\r\n")
+        sess = session(reader)
+        deliver = AsyncMock()
+        async def submit(raw, mail_from, rcpts):
+            msg = build_outgoing(raw, mail_from, rcpts, "user@example.com")
+            await deliver(msg)
+        sess.s.send_message = submit
+        sess.mail_started, sess.rcpts = True, ["recipient@example.com"]
+        assert await sess.smtp_data("")
+        assert b"554 5.6.0" in sess.writer.data and b"250 OK message accepted" not in sess.writer.data
+        assert not sess.mail_started and not sess.rcpts
+        deliver.assert_not_awaited()
+        assert await sess.read_line() == b"NOOP"
+    asyncio.run(run())
+
+
 def test_login_accepts_initial_username_response_and_malformed_login_is_recoverable():
     async def run():
         reader = asyncio.StreamReader()

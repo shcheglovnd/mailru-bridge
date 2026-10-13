@@ -93,6 +93,24 @@ def test_inline_image_without_disposition_is_preserved():
     assert out.attachments[0].content_id == "image1"
 
 
+@pytest.mark.parametrize("content_type", ["multipart/signed", "multipart/encrypted",
+                                        "application/pkcs7-mime", "application/x-pkcs7-mime"])
+def test_protected_message_format_rejected_before_json_conversion(content_type):
+    from mailru_bridge.outgoing import UnsupportedMessage
+    raw = (f"From: user@example.com\r\nTo: recipient@example.com\r\n"
+           f"Content-Type: {content_type}\r\n\r\nprotected body").encode()
+    with pytest.raises(UnsupportedMessage, match="raw-message submission"):
+        build_outgoing(raw, "user@example.com", ["recipient@example.com"], "user@example.com")
+
+
+def test_protected_file_attachment_can_still_be_sent_as_an_attachment():
+    msg = EmailMessage()
+    msg.set_content("see attached file")
+    msg.add_attachment(b"PROTECTED FILE", maintype="application", subtype="pkcs7-mime", filename="file.p7m")
+    outgoing = build_outgoing(msg.as_bytes(), "user@example.com", ["recipient@example.com"], "user@example.com")
+    assert outgoing.attachments[0].content == b"PROTECTED FILE"
+
+
 @pytest.mark.parametrize("kwargs", [{"tls_cert": "cert.pem"}, {"tls_key": "key.pem"},
                                      {"poll_seconds": 0}, {"sync_window": -1},
                                      {"initial_depth": -1}, {"imap_port": 0},

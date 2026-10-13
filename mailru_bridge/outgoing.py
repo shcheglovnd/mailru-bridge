@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import email
+import re
 from email.headerregistry import Address
 from email.policy import default as default_policy, SMTP
 from email.utils import getaddresses, parseaddr
 
 from .api import Attachment, OutgoingMessage
+
+
+class UnsupportedMessage(ValueError):
+    """A MIME format that the API's structured composer cannot preserve."""
 
 
 def _addresses(msg, header: str) -> list[tuple[str, str]]:
@@ -42,6 +47,10 @@ def build_outgoing(raw: bytes, mail_from: str, rcpts: list[str], default_from: s
         nonlocal text, html
         ctype = part.get_content_type()
         disp = part.get_content_disposition()
+        if disp != "attachment" and ctype in {
+            "multipart/signed", "multipart/encrypted", "application/pkcs7-mime", "application/x-pkcs7-mime",
+        }:
+            raise UnsupportedMessage("PGP/MIME and S/MIME require raw-message submission, which the Mail.ru API does not provide")
         filename = part.get_filename()
         cid = str(part.get("Content-ID", "")).strip().strip("<>") or None
         is_attachment = (
@@ -73,12 +82,14 @@ def build_outgoing(raw: bytes, mail_from: str, rcpts: list[str], default_from: s
     if text is None and html is None:
         text = ""
     priority = str(msg.get("X-Priority", "")).strip()
+    reply_ids = re.findall(r"<[^<>\s]+>", str(msg.get("In-Reply-To", "")))
     return OutgoingMessage(
         sender=str(msg.get("From") or mail_from or default_from),
         to=to, cc=cc, bcc=bcc, subject=str(msg.get("Subject", "")),
         text=text, html=html, attachments=attachments,
         priority=1 if priority.startswith(("1", "2")) else 5 if priority.startswith(("4", "5")) else 3,
         receipt=bool(msg.get("Disposition-Notification-To")),
+        in_reply_to=reply_ids[-1] if reply_ids else None,
     )
 
 
