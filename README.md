@@ -1,5 +1,7 @@
 # mailru-bridge
 
+[![Tests](https://github.com/shcheglovnd/mailru-bridge/actions/workflows/tests.yml/badge.svg)](https://github.com/shcheglovnd/mailru-bridge/actions/workflows/tests.yml)
+
 Standard **IMAP/SMTP** access to a free **Mail.ru / VK Почта** mailbox, for desktop and
 mobile mail clients (Thunderbird, FairEmail, …).
 
@@ -29,7 +31,9 @@ submitted through the API's send endpoint.
 ## Install
 
 ```sh
-python -m venv .venv && . .venv/bin/activate
+git clone https://github.com/shcheglovnd/mailru-bridge.git
+cd mailru-bridge
+python3 -m venv .venv && . .venv/bin/activate
 pip install -e .
 ```
 
@@ -110,8 +114,11 @@ S/MIME submission is rejected before sending; incoming raw-source fetching remai
 
 ```sh
 pip install -e '.[dev]'
+git config core.hooksPath .githooks
 python -m pytest -q
 ```
+
+GitHub Actions runs the test suite on Python 3.11 and 3.12 for pushes and pull requests.
 
 Tests use temporary caches, mocked API requests, and local IMAP/SMTP sockets; they do not send or
 delete real mail. They cover authentication gates, UID ranges and scoped expunges, draft safety,
