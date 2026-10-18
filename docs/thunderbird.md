@@ -78,3 +78,8 @@ Local socket replays cover namespace/subscription discovery, Thunderbird's heade
 attributes, chunked downloads (including past EOF), tags, UID-mapped moves, non-synchronizing
 APPEND literals, repeated draft saves, and scoped deletion of the old draft. Mailbox mutations
 use mocks. This is protocol testing; the Thunderbird GUI was not installed on the test host.
+
+Separately, on 18 October 2026, a user tested the deployed bridge with Thunderbird and FairEmail:
+reading a message in Thunderbird marked it read in Mail.ru's web interface and, after the
+cross-client notification fix, on the phone. This confirms that live read-state path; other
+Thunderbird GUI workflows have not all been verified on a real account.

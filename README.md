@@ -118,6 +118,22 @@ folder mutations refresh it immediately. Large FETCH commands stream ready messa
 ten in flight, rather than waiting for every source download before the first response. Pending
 downloads are cancelled if the client disconnects. Temporary API poll failures keep IDLE open.
 
+### Troubleshooting
+
+- **Thunderbird says the message was sent but a Sent copy could not be saved:** in
+  **Account Settings → Copies & Folders**, clear **Place a copy in** for sent messages.
+  Mail.ru already saves that copy. Do not resend solely because of this warning.
+- **Read flags differ between clients:** changes made through the bridge wake other selected
+  IDLE clients immediately. Changes made in Mail.ru's web interface need an upstream poll
+  (default 180 seconds); older flags are also swept every 900 seconds. A busy sync can defer
+  a manual refresh. If the difference persists, check the bridge logs and authentication state.
+- **Refresh stalls during a large offline download:** limit Thunderbird's offline folders;
+  see [history and offline downloads](docs/thunderbird.md#history-and-offline-downloads).
+  Repeated disconnects still need investigation using bridge logs and the client's connection.
+
+Keep the SQLite cache when troubleshooting: it holds stable IMAP UIDs and local client tags.
+Deleting it resets mailbox identity and loses that local state.
+
 ## Development checks
 
 ```sh
@@ -127,6 +143,9 @@ python -m pytest -q
 ```
 
 GitHub Actions runs the test suite on Python 3.11 and 3.12 for pushes and pull requests.
+As of 18 October 2026, all 243 tests pass on both versions. A live client check also confirmed
+that reading a message in Thunderbird updates its read state in Mail.ru's web interface and
+FairEmail on a phone; see [verification details](docs/thunderbird.md#verification).
 
 Tests use temporary caches, mocked API requests, and local IMAP/SMTP sockets; they do not send or
 delete real mail. They cover authentication gates, UID ranges and scoped expunges, draft safety,

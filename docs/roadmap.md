@@ -73,5 +73,6 @@
 
 ### Resolved questions
 - Raw RFC822 source exists (`messages/message/download`) — no need to rebuild from JSON.
-- Polling: incremental `messages/status` over a newest-first window; IDLE is poll-backed for now.
+- Polling: incremental `messages/status` over a newest-first window. Remote changes reach IDLE
+  through polling; shared-cache changes from other bridge clients wake IDLE immediately.
 - Anti-fraud: keep one pinned device and a single rate-limited request stream (see `api.RateLimiter`).
