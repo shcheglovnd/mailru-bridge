@@ -82,8 +82,8 @@ dispatching mail. The first time
 a large folder is opened the bridge syncs its newest messages (configurable depth) into a local
 cache; later opens are served from the cache and only new mail is fetched.
 
-What works: folder list, message list, reading (headers shown without downloading the whole
-message; the full source is fetched once when you open a message and then cached), mark read/unread
+What works: folder list, message list, reading (ENVELOPE uses metadata; header/body FETCH downloads
+the full source once and then uses the cache), mark read/unread
 and flagged, move, delete (to Trash), create/rename/delete folders, IDLE, and sending with
 attachments. `COPY` is not supported (Mail.ru has no copy — use move); arbitrary `APPEND` is limited
 (only Drafts is supported; Sent APPEND returns an error rather than claiming to store a copy).
@@ -95,8 +95,9 @@ without downloading bodies or resetting UIDs.
 SEARCH supports flags, received/sent dates, sender/recipient/subject/custom headers, body/text,
 sizes, sequence/UID sets, AND, OR, NOT and grouping, including literal arguments inside groups.
 Date and flag searches used for normal FairEmail synchronization work without downloading bodies.
-Manual SEARCH polls for arrivals immediately and publishes messages added since the folder was
-opened; it does not wait for the background poll. Custom-header, sent-date and body searches may
+Manual SEARCH polls for arrivals when the sync queue is free and publishes messages added since
+the folder was opened. During a busy sync/mutation, cached reads stay responsive; background polling
+continues the refresh. Custom-header, sent-date and body searches may
 download uncached sources; cheap date/UID/flag filters are evaluated first to limit that work.
 Read-only `EXAMINE` sessions cannot modify mail.
 
@@ -109,6 +110,13 @@ accepts client flags/internal dates and literal mailbox names. Tags and client r
 persist in the bridge cache across refreshes, restarts, and bridge moves. SMTP replies resolve their
 In-Reply-To against cached headers to pass Mail.ru's reply reference. Unsupported PGP/MIME and
 S/MIME submission is rejected before sending; incoming raw-source fetching remains available.
+
+Selected IDLE clients receive cached flags/arrivals/moves as soon as another bridge client or a
+sync updates them. SEARCH/FETCH also publish changed flags without renumbering existing messages.
+LIST/LSUB use the cached tree; external folder changes arrive through background polling, while
+folder mutations refresh it immediately. Large FETCH commands stream ready messages with at most
+ten in flight, rather than waiting for every source download before the first response. Pending
+downloads are cancelled if the client disconnects. Temporary API poll failures keep IDLE open.
 
 ## Development checks
 

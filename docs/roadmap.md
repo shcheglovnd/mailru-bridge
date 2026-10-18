@@ -65,6 +65,10 @@
       concurrent moves, cached original-message references on SMTP replies, and explicit protected
       MIME submission errors. Socket replays cover header sync, chunks and draft replacement.
 - [x] [Thunderbird setup and compatibility notes](thunderbird.md).
+- [x] Keep cached mailbox reads responsive during bulk sync, stream bounded FETCH responses,
+      cancel downloads on disconnect, and retain IDLE across temporary upstream poll failures.
+- [x] Immediate cross-client IDLE cache notifications and flag updates during manual SEARCH/FETCH;
+      regression replay covers a Thunderbird body read reaching FairEmail without a polling delay.
 - [ ] Packaging and FairEmail setup docs.
 
 ### Resolved questions

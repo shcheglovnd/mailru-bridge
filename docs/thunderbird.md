@@ -60,6 +60,12 @@ message list; because the API provides full raw sources, those initial header re
 also download/cache bodies. Full offline sync of a large folder can take time. Partial body
 FETCH works against the cached source and returns the corrected RFC822.SIZE.
 
+Large FETCH commands return each message as its source becomes available. Folder listings and
+already initialized cached mailboxes stay readable while a different synchronization is busy.
+Read/unread changes made by Thunderbird are pushed to other selected IDLE clients from the cache;
+manual SEARCH/FETCH also publish changed flags. A busy queue can defer an upstream refresh, while
+the client continues to see the last cached state and receives later background updates.
+
 ## Verification
 
 The compatibility review used Thunderbird's current

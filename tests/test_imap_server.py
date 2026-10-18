@@ -333,6 +333,108 @@ def test_poll_reconciles_changes_already_applied_by_another_client(connection):
     assert b"1 FETCH (UID 2 FLAGS (\\Seen))" in connection.writer.data
 
 
+def test_manual_refresh_publishes_seen_change_from_another_client(connection):
+    select(connection, [set()])
+    desktop = ImapConnection(connection.s, None, Writer())
+    desktop.authed, desktop.selected = True, "0"
+    desktop._rebuild_snapshot()
+    dispatch(desktop, b"UID STORE 1 +FLAGS.SILENT (\\Seen)")
+    connection.s.api.mark.assert_awaited_once_with("0", read=["100"])
+    dispatch(connection, b"UID SEARCH UNDELETED")
+    flag_update = b"* 1 FETCH (UID 1 FLAGS (\\Seen))\r\n"
+    assert flag_update in connection.writer.data
+    assert connection.writer.data.index(flag_update) < connection.writer.data.index(b"* SEARCH 1\r\n")
+
+
+def test_cached_flag_refresh_defers_expunge_and_uses_original_sequence_numbers(connection):
+    select(connection, [set(), set()])
+    connection.s.cache.forget("0", [1])
+    connection.s.cache.update_flags("0", 2, {"\\Seen"})
+    dispatch(connection, b"UID SEARCH ALL")
+    assert b"* 2 FETCH (UID 2 FLAGS (\\Seen))\r\n" in connection.writer.data
+    assert b"EXPUNGE" not in connection.writer.data
+    connection.writer.data.clear()
+    dispatch(connection, b"NOOP")
+    assert b"* 1 EXPUNGE\r\n" in connection.writer.data
+    assert connection.snapshot == [2]
+
+
+def test_thunderbird_read_reaches_fairemail_idle_and_manual_refresh_over_sockets(connection):
+    from mailru_bridge.sync import Syncer
+    import re
+    async def run():
+        select(connection, [set()])
+        connection.s.cache.set_raw("0", 1, b"Subject: original\r\n\r\nbody")
+        connection.s.syncer.ensure_raw = Syncer(connection.s.api, connection.s.cache).ensure_raw
+        connection.s.config.check_login = lambda user, password: True
+        listener = await asyncio.start_server(connection.s._handle, "127.0.0.1", 0)
+        async with listener:
+            phone_r, phone_w = await asyncio.open_connection("127.0.0.1", listener.sockets[0].getsockname()[1])
+            desktop_r, desktop_w = await asyncio.open_connection("127.0.0.1", listener.sockets[0].getsockname()[1])
+            async def command(reader, writer, tag, command):
+                writer.write(tag + b" " + command + b"\r\n")
+                await writer.drain()
+                lines = []
+                while True:
+                    line = await asyncio.wait_for(reader.readline(), 1)
+                    assert line
+                    lines.append(line)
+                    literal = re.search(rb"\{(\d+)\}\r\n$", line)
+                    if literal:
+                        await reader.readexactly(int(literal[1]))
+                    if line.startswith(tag + b" "):
+                        assert line.startswith(tag + b" OK "), line
+                        return b"".join(lines)
+            try:
+                for reader, writer in [(phone_r, phone_w), (desktop_r, desktop_w)]:
+                    assert b"mailru-bridge ready" in await reader.readline()
+                    await command(reader, writer, b"login", b"LOGIN user@example.com test-password")
+                    await command(reader, writer, b"select", b"SELECT INBOX")
+                polls = connection.s.syncer.incremental_sync.await_count
+                phone_w.write(b"idle IDLE\r\n")
+                await phone_w.drain()
+                assert await phone_r.readline() == b"+ idling\r\n"
+                # Thunderbird opens a body, implicitly marking the message read upstream.
+                await command(desktop_r, desktop_w, b"read", b"UID FETCH 1 BODY[]")
+                assert await asyncio.wait_for(phone_r.readline(), 1) == b"* 1 FETCH (UID 1 FLAGS (\\Seen))\r\n"
+                connection.s.api.mark.assert_awaited_once_with("0", read=["100"])
+                assert connection.s.syncer.incremental_sync.await_count == polls
+                # Unread changes propagate too, without waiting for the 180-second timer.
+                await command(desktop_r, desktop_w, b"unread", b"UID STORE 1 -FLAGS.SILENT (\\Seen)")
+                assert await asyncio.wait_for(phone_r.readline(), 1) == b"* 1 FETCH (UID 1 FLAGS ())\r\n"
+                phone_w.write(b"DONE\r\n")
+                await phone_w.drain()
+                assert await phone_r.readline() == b"idle OK IDLE terminated\r\n"
+                # During a manual refresh, SEARCH also publishes changes already in cache.
+                await command(desktop_r, desktop_w, b"seen", b"UID STORE 1 +FLAGS.SILENT (\\Seen)")
+                result = await command(phone_r, phone_w, b"refresh", b"UID SEARCH UNDELETED")
+                assert b"* 1 FETCH (UID 1 FLAGS (\\Seen))\r\n" in result
+                assert b"* SEARCH 1\r\n" in result
+                await command(phone_r, phone_w, b"bye", b"LOGOUT")
+                await command(desktop_r, desktop_w, b"bye", b"LOGOUT")
+            finally:
+                phone_w.close()
+                desktop_w.close()
+                await asyncio.gather(phone_w.wait_closed(), desktop_w.wait_closed())
+        assert not connection.s._connections
+    asyncio.run(run())
+
+
+def test_remote_sync_wakes_selected_connection_after_web_flag_change(connection):
+    async def run():
+        select(connection, [set()])
+        connection.s._connections.add(connection)
+        async def remote_sync(fid, window):
+            connection.s.cache.update_remote_flags(fid, 1, {"\\Seen"})
+            return 0, []
+        connection.s.syncer.incremental_sync.side_effect = remote_sync
+        await connection.s.incremental("0")
+        assert connection._changed.is_set()
+        await connection._reconcile_cached(allow_expunge=True)
+        assert b"* 1 FETCH (UID 1 FLAGS (\\Seen))\r\n" in connection.writer.data
+    asyncio.run(run())
+
+
 def test_modified_utf7_select_and_namespace(connection):
     connection.authed = True
     dispatch(connection, b'SELECT "' + encode("Письма") + b'"')
@@ -403,6 +505,150 @@ def test_idle_cancellation_stops_the_reader_task(connection):
         connection.reader.feed_data(b"next\r\n")
         assert await connection.read_line() == b"next"
 
+    asyncio.run(run())
+
+
+def test_cached_mailbox_commands_do_not_wait_behind_busy_sync(connection):
+    async def run():
+        select(connection, [set()])
+        connection.s.cache.set_last_sync("0", 100)
+        async with connection.s._lock:
+            for command in (b'LIST "" "*"', b'LSUB "" "*"', b'STATUS INBOX (MESSAGES UNSEEN)',
+                            b'SELECT INBOX', b'NOOP', b'CHECK', b'UID SEARCH ALL'):
+                await asyncio.wait_for(connection.dispatch([("t", b"A1 " + command)]), .5)
+        assert b"* SEARCH 1\r\n" in connection.writer.data
+        assert connection.writer.data.count(b"A1 OK ") == 7
+        connection.s.syncer.sync_folders.assert_not_awaited()
+        connection.s.syncer.incremental_sync.assert_not_awaited()
+    asyncio.run(run())
+
+
+def test_folder_mutations_still_force_authoritative_tree_refresh(connection):
+    connection.authed = True
+    dispatch(connection, b'CREATE "new"')
+    connection.s.api.create_folder.assert_awaited_once_with("new", "-1")
+    connection.s.syncer.sync_folders.assert_awaited_once()
+
+
+def test_background_sync_still_waits_for_mutation_lock(connection):
+    async def run():
+        async with connection.s._lock:
+            task = asyncio.create_task(connection.s.incremental("0"))
+            await asyncio.sleep(0)
+            assert not task.done()
+            connection.s.syncer.incremental_sync.assert_not_awaited()
+        await asyncio.wait_for(task, .5)
+        connection.s.syncer.incremental_sync.assert_awaited_once()
+    asyncio.run(run())
+
+
+def test_fetch_streams_ready_message_before_slow_ones_and_bounds_active_downloads(connection):
+    async def run():
+        select(connection, [set() for _ in range(30)])
+        release, first_response = asyncio.Event(), asyncio.Event()
+        started = set()
+        async def fetch_one(seq, uid, items, by_uid):
+            started.add(uid)
+            if uid != 2:
+                await release.wait()
+            return f"{seq} FETCH (UID {uid} BODY[HEADER] {{0}}\r\n)".encode()
+        connection._fetch_one = fetch_one
+        old_drain = connection.writer.drain
+        async def drain():
+            await old_drain()
+            if b"* 2 FETCH (UID 2 " in connection.writer.data:
+                first_response.set()
+        connection.writer.drain = drain
+        task = asyncio.create_task(connection.dispatch([("t", b"A1 UID FETCH 1:* BODY.PEEK[HEADER]")]))
+        try:
+            await asyncio.wait_for(first_response.wait(), .5)
+            await asyncio.sleep(0)
+            assert not task.done()
+            assert b"* 1 FETCH" not in connection.writer.data
+            assert len(started) <= 11  # one returned plus at most ten active
+            release.set()
+            await asyncio.wait_for(task, .5)
+            assert len(started) == 30
+            assert connection.writer.data.count(b" FETCH (") == 30
+            assert b"A1 OK UID FETCH completed" in connection.writer.data
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(run())
+
+
+def test_fetch_disconnect_cancels_other_downloads_and_stops_scheduling(connection):
+    async def run():
+        select(connection, [set() for _ in range(30)])
+        pending, cancelled = set(), set()
+        async def fetch_one(seq, uid, items, by_uid):
+            pending.add(uid)
+            if uid == 1:
+                return b"1 FETCH (UID 1 BODY[HEADER] {0}\r\n)"
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.add(uid)
+        async def broken_drain():
+            raise ConnectionResetError("client closed")
+        connection._fetch_one = fetch_one
+        connection.writer.drain = broken_drain
+        with pytest.raises(ConnectionResetError):
+            await connection.cmd_fetch(b"A1", b"1:* BODY.PEEK[HEADER]", [], by_uid=True)
+        assert len(pending) <= 10
+        assert cancelled == pending - {1}
+        assert not [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+    asyncio.run(run())
+
+
+def test_client_reset_is_not_retried_as_an_internal_error(connection, caplog):
+    async def run():
+        connection.reader = asyncio.StreamReader()
+        connection.reader.feed_data(b"A1 NOOP\r\n")
+        connection.reader.feed_eof()
+        calls = 0
+        async def drain():
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise ConnectionResetError("client closed")
+        connection.writer.drain = drain
+        with caplog.at_level(logging.ERROR):
+            await connection.serve()
+        assert calls == 2  # greeting and response, no attempt at a second error response
+        assert "command failed" not in caplog.text
+    asyncio.run(run())
+
+
+def test_idle_survives_temporary_api_failure_until_done(connection):
+    from mailru_bridge.api import ApiError
+    async def run():
+        select(connection)
+        connection.reader = asyncio.StreamReader()
+        connection.s.config.poll_seconds = .01
+        retried = asyncio.Event()
+        polls = 0
+        async def poll():
+            nonlocal polls
+            polls += 1
+            if polls == 1:
+                raise ApiError("temporary upstream failure")
+            retried.set()
+            connection.reader.feed_data(b"DONE\r\n")
+        connection.poll_selected = poll
+        task = asyncio.create_task(connection.cmd_idle(b"A1", b"", []))
+        try:
+            await asyncio.wait_for(retried.wait(), .5)
+            await asyncio.wait_for(task, .5)
+            assert b"A1 OK IDLE terminated" in connection.writer.data
+            assert b"A1 NO" not in connection.writer.data
+            assert not connection._idle
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
     asyncio.run(run())
 
 

@@ -134,6 +134,7 @@ class ImapConnection:
         self.snapshot_flags: dict[int, set[str]] = {}
         self.peer = writer.get_extra_info("peername")
         self._idle = False
+        self._changed = asyncio.Event()
 
     # -- io --------------------------------------------------------------------------------
 
@@ -236,6 +237,11 @@ class ImapConnection:
             try:
                 if not await self.dispatch(tokens):
                     break
+            except ConnectionError:
+                # The client may have switched networks or timed out. A dead socket cannot
+                # receive a tagged error; do not retry writes and log a second traceback.
+                log.debug("IMAP client disconnected")
+                break
             except AuthExpired as exc:
                 await self._fail_all("session expired; re-run `mailru-bridge login`", exc)
             except ApiError as exc:
@@ -525,6 +531,7 @@ class ImapConnection:
         self.readonly = False
         self.snapshot = []
         self.snapshot_flags = {}
+        self._changed.clear()
 
     async def cmd_create(self, tag, rest, tokens) -> bool:
         args = _split_astrings(tokens)
@@ -611,14 +618,20 @@ class ImapConnection:
         """Re-sync the selected folder and emit EXISTS/EXPUNGE for any change."""
         if not self.selected:
             return
-        await self.s.incremental(self.selected)
+        await self.s.incremental(self.selected, wait=False)
+        await self._reconcile_cached(allow_expunge=True)
+
+    async def _reconcile_cached(self, *, allow_expunge: bool) -> None:
+        """Publish this connection's cache changes, preserving sequence numbers when required."""
+        if not self.selected:
+            return
         # Another connection or the background poll may have already applied the sync.
         # Compare this connection's view with the cache rather than relying on that sync's delta.
         messages = self.s.cache.messages(self.selected)
         live = {m.uid for m in messages}
         expunged = set(self.snapshot) - live
         # EXPUNGE first (highest seq first), against the old snapshot
-        if expunged:
+        if allow_expunge and expunged:
             exp_set = set(expunged)
             for seq in range(len(self.snapshot), 0, -1):
                 if self.snapshot[seq - 1] in exp_set:
@@ -633,11 +646,15 @@ class ImapConnection:
             await self.untagged(f"{len(self.snapshot)} EXISTS")
         by_uid = {m.uid: m for m in messages}
         for seq, uid in enumerate(self.snapshot, 1):
-            cm = by_uid[uid]
+            cm = by_uid.get(uid)
+            if cm is None:
+                continue  # FETCH/SEARCH must defer expunges and keep their old sequence map
             if uid in self.snapshot_flags and cm.flags != self.snapshot_flags[uid]:
                 await self.untagged(b"%d FETCH (UID %d FLAGS (" % (seq, uid)
                                     + " ".join(sorted(cm.flags)).encode() + b"))")
-        self.snapshot_flags = {m.uid: set(m.flags) for m in messages}
+            self.snapshot_flags[uid] = set(cm.flags)
+        visible = set(self.snapshot)
+        self.snapshot_flags = {uid: flags for uid, flags in self.snapshot_flags.items() if uid in visible}
 
     async def _append_cached_arrivals(self) -> None:
         """Publish new arrivals without renumbering existing messages during SEARCH/FETCH.
@@ -645,13 +662,7 @@ class ImapConnection:
         Non-UID SEARCH/FETCH must defer EXPUNGE notifications until a safe command boundary.
         The cache may already have been updated by another connection or a background poll.
         """
-        known = set(self.snapshot)
-        for cm in self.s.cache.messages(self.selected):
-            if cm.uid not in known:
-                self.snapshot.append(cm.uid)
-                self.snapshot_flags[cm.uid] = set(cm.flags)
-        if len(self.snapshot) != len(known):
-            await self.untagged(f"{len(self.snapshot)} EXISTS")
+        await self._reconcile_cached(allow_expunge=False)
 
     # -- FETCH -----------------------------------------------------------------------------
 
@@ -669,37 +680,43 @@ class ImapConnection:
         ranges = self._ranges(seqset, by_uid)
         targets = self._resolve(ranges, by_uid)
         items = _parse_fetch_items(items_spec)
-        # If any item needs the raw message, download all of them concurrently (bounded) before
-        # formatting — otherwise a multi-message FETCH would fetch bodies one-at-a-time and crawl.
+        # Stream source-dependent responses as each message becomes ready. Waiting for every
+        # download before the first response makes large header/offline syncs time out.
         if targets and any(_needs_raw(it) for it in items):
-            await self._prefetch_raw([uid for _, uid in targets])
-        for seq, uid in targets:
-            resp = await self._fetch_one(seq, uid, items, by_uid)
-            if resp is not None:
-                await self.untagged(resp)
+            await self._stream_fetch(targets, items, by_uid)
+        else:
+            for seq, uid in targets:
+                resp = await self._fetch_one(seq, uid, items, by_uid)
+                if resp is not None:
+                    await self.untagged(resp)
         await self.tagged(tag, "OK", ("UID " if by_uid else "") + "FETCH completed")
         return True
 
-    async def _prefetch_raw(self, uids: list[int], concurrency: int = 10) -> None:
-        """Warm the raw-source cache for many messages at once, bounded by a semaphore.
+    async def _stream_fetch(self, targets, items, by_uid, concurrency: int = 10) -> None:
+        """Keep at most ten messages in flight, with backpressure and disconnect cleanup."""
+        remaining = iter(targets)
+        active: set[asyncio.Task] = set()
 
-        The shared rate limiter still spaces request starts; this just lets the ~1.5s downloads
-        overlap instead of running strictly in series.
-        """
-        need = [u for u in uids if self.s.cache.get_raw(self.selected, u) is None]
-        if not need:
-            return
-        log.info("prefetch: %d/%d bodies need download (folder %s)", len(need), len(uids), self.selected)
-        sem = asyncio.Semaphore(concurrency)
+        def start_one() -> None:
+            target = next(remaining, None)
+            if target is not None:
+                active.add(asyncio.create_task(self._fetch_one(*target, items, by_uid)))
 
-        async def one(u: int) -> None:
-            async with sem:
-                try:
-                    await self.s.syncer.ensure_raw(self.selected, u)
-                except Exception:  # noqa: BLE001 — a single bad message must not fail the batch
-                    log.debug("prefetch raw failed for uid %s", u, exc_info=True)
-
-        await asyncio.gather(*(one(u) for u in need))
+        for _ in range(min(concurrency, len(targets))):
+            start_one()
+        try:
+            while active:
+                ready, _ = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+                for task in ready:
+                    response = task.result()
+                    if response is not None:
+                        await self.untagged(response)
+                    active.remove(task)
+                    start_one()
+        finally:
+            for task in active:
+                task.cancel()
+            await asyncio.gather(*active, return_exceptions=True)
 
     async def _fetch_one(self, seq: int, uid: int, items: list[str], by_uid: bool) -> bytes | None:
         cm = self.s.cache.message_by_uid(self.selected, uid)
@@ -760,6 +777,8 @@ class ImapConnection:
                       for p in pieces]
             if not any(p.startswith(b"FLAGS") for p in pieces):
                 pieces.append(b"FLAGS (" + " ".join(sorted(cm.flags)).encode() + b")")
+        if any(p.startswith(b"FLAGS") for p in pieces):
+            self.snapshot_flags[uid] = set(cm.flags)
         return b"%d FETCH (" % seq + b" ".join(pieces) + b")"
 
     def _fetch_body_item(self, item: str, mime: MimeMessage | None) -> tuple[bytes | None, bool]:
@@ -799,6 +818,7 @@ class ImapConnection:
         ranges = self._ranges(seqset, by_uid)
         for seq, uid in self._resolve(ranges, by_uid):
             newflags = await self.s.apply_flags(self.selected, uid, mode, flags)
+            self.snapshot_flags[uid] = set(newflags)
             if not silent:
                 extra = (b" UID %d" % uid) if by_uid else b""
                 await self.untagged(b"%d FETCH (FLAGS (" % seq + " ".join(sorted(newflags)).encode() + b")" + extra + b")")
@@ -838,6 +858,8 @@ class ImapConnection:
             if ids:
                 await self.s.api.move(ids, dest)
                 mapping = self.s.cache.move_messages(self.selected, dest, uids)
+                self.s.notify_changes(self.selected)
+                self.s.notify_changes(dest)
                 validity = self.s.cache.folder(dest)["uidvalidity"]
         if mapping:
             source_set = ",".join(str(u) for u in mapping)
@@ -885,6 +907,8 @@ class ImapConnection:
             del self.snapshot[idx]
             if not silent:
                 await self.untagged(f"{idx + 1} EXPUNGE")
+        self.s.notify_changes(self.selected)
+        self.s.notify_changes("500002")
 
     def _has_deleted(self, uid: int) -> bool:
         cm = self.s.cache.message_by_uid(self.selected, uid)
@@ -908,7 +932,7 @@ class ImapConnection:
             return True
         # A manual refresh must see arrivals now, even if the periodic poll/IDLE timer has
         # not fired. Compile ranges after publishing them so UID '*' uses the current maximum.
-        await self.s.incremental(self.selected)
+        await self.s.incremental(self.selected, wait=False)
         await self._append_cached_arrivals()
         predicate = compile_search(args, _split_astrings, self._ranges)
         results = []
@@ -981,16 +1005,33 @@ class ImapConnection:
         await self.send(b"+ idling")
         self._idle = True
         done = asyncio.create_task(self._await_done())
+        changed = asyncio.create_task(self._changed.wait())
         try:
             while not done.done():
-                try:
-                    await asyncio.wait_for(asyncio.shield(done), timeout=self.s.config.poll_seconds)
-                except asyncio.TimeoutError:
-                    await self.poll_selected()
+                ready, _ = await asyncio.wait((done, changed), timeout=self.s.config.poll_seconds,
+                                             return_when=asyncio.FIRST_COMPLETED)
+                if done in ready:
+                    break
+                if changed in ready:
+                    self._changed.clear()
+                    # Another client/sync already updated the cache. Notify flags/arrivals now
+                    # without making another upstream request or waiting for the polling timer.
+                    await self._reconcile_cached(allow_expunge=True)
+                    changed = asyncio.create_task(self._changed.wait())
+                else:
+                    try:
+                        await self.poll_selected()
+                    except AuthExpired:
+                        raise
+                    except ApiError:
+                        # Temporary upstream failures do not terminate an otherwise healthy
+                        # IMAP IDLE session; the next timer tick will retry normally.
+                        log.warning("temporary upstream failure during IDLE poll")
         finally:
             self._idle = False
             done.cancel()
-            await asyncio.gather(done, return_exceptions=True)
+            changed.cancel()
+            await asyncio.gather(done, changed, return_exceptions=True)
         await self.tagged(tag, "OK", "IDLE terminated")
         return True
 
@@ -1230,6 +1271,13 @@ class ImapServer:
         self._initial: set[str] = set()
         self._lock = asyncio.Lock()
         self._folders_synced_at = 0.0
+        self._connections: set[ImapConnection] = set()
+
+    def notify_changes(self, fid: str | None = None) -> None:
+        """Wake selected IDLE connections after a completed cache update."""
+        for conn in self._connections:
+            if conn.selected is not None and (fid is None or conn.selected == fid):
+                conn._changed.set()
 
     def capabilities(self) -> str:
         caps = ["IMAP4rev1", "AUTH=PLAIN", "SASL-IR", "IDLE", "MOVE", "UIDPLUS", "LITERAL+", "NAMESPACE", "ID", "UNSELECT"]
@@ -1239,24 +1287,33 @@ class ImapServer:
         return any(r["parent"] == fid for r in self.cache.folders())
 
     async def refresh_tree(self) -> None:
-        await self.sync_folders()
-        self.tree.refresh()
+        # LIST/LSUB describe the cached tree. Background polling updates external changes;
+        # never make a reconnect wait behind another folder's initial/history synchronization.
+        if not self.cache.folders():
+            await self.sync_folders()
+        else:
+            self.tree.refresh()
 
     async def sync_and_refresh(self) -> None:
-        await self.refresh_tree()
+        # Folder mutations must still refresh synchronously before acknowledging completion.
+        await self.sync_folders()
 
     async def sync_folders(self) -> None:
         async with self._lock:
             await self.syncer.sync_folders()
             self._folders_synced_at = time.monotonic()
             self.tree.refresh()
+            self.notify_changes()
 
     async def _incremental_locked(self, fid: str) -> tuple[int, list[int]]:
         if time.monotonic() - self._folders_synced_at >= self.config.poll_seconds:
             await self.syncer.sync_folders()
             self._folders_synced_at = time.monotonic()
             self.tree.refresh()
-        return await self.syncer.incremental_sync(fid, window=self.config.sync_window)
+            self.notify_changes()
+        result = await self.syncer.incremental_sync(fid, window=self.config.sync_window)
+        self.notify_changes(fid)
+        return result
 
     def _deep_synced(self, fid: str) -> bool:
         # Persisted so a restart doesn't re-pull history (the cache survives). A shallow STATUS
@@ -1265,16 +1322,25 @@ class ImapServer:
 
     async def ensure_initial(self, fid: str) -> None:
         """On SELECT: do the full initial sync once per folder (to initial_depth), else incremental."""
+        folder = self.cache.folder(fid)
+        if (self._lock.locked() and self._deep_synced(fid)
+                and folder is not None and folder["last_sync"]):
+            self._initial.add(fid)
+            return
         async with self._lock:
             if not self._deep_synced(fid):
                 await self.syncer.initial_sync(fid, depth=self.config.initial_depth)
                 self.cache.set_meta(f"deep:{fid}", "1")
+                self.notify_changes(fid)
             else:
                 await self._incremental_locked(fid)
         self._initial.add(fid)
 
     async def sync_folder_quietly(self, fid: str) -> None:
         """For STATUS: a light touch only. Never claims a deep sync, so SELECT still loads depth."""
+        folder = self.cache.folder(fid)
+        if self._lock.locked() and folder is not None and folder["last_sync"]:
+            return
         async with self._lock:
             if self._deep_synced(fid):
                 await self._incremental_locked(fid)
@@ -1282,10 +1348,15 @@ class ImapServer:
                 folder = self.cache.folder(fid)
                 if folder is None or folder["last_sync"] == 0:
                     await self.syncer.initial_sync(fid, depth=min(self.config.initial_depth, 300))
+                    self.notify_changes(fid)
                 else:
                     await self._incremental_locked(fid)
 
-    async def incremental(self, fid: str) -> tuple[int, list[int]]:
+    async def incremental(self, fid: str, *, wait: bool = True) -> tuple[int, list[int]]:
+        # Client reads can use the last consistent cache while a writer/sync is busy. The
+        # background poll and post-send refresh retain their serialized, waiting behavior.
+        if not wait and self._lock.locked():
+            return 0, []
         async with self._lock:
             return await self._incremental_locked(fid)
 
@@ -1301,6 +1372,7 @@ class ImapServer:
                 await self.api.mark(fid, unread=[cm.mailru_id])
                 cm.flags.discard("\\Seen")
             self.cache.update_flags(fid, uid, cm.flags)
+            self.notify_changes(fid)
 
     async def apply_flags(self, fid: str, uid: int, mode: str, flags: set[str]) -> set[str]:
         async with self._lock:
@@ -1327,6 +1399,7 @@ class ImapServer:
             elif was_flag and not now_flag:
                 await self.api.mark(fid, unflag=[mid])
             self.cache.update_client_flags(fid, uid, target)
+            self.notify_changes(fid)
             return target
 
     async def save_draft(self, raw: bytes, flags: set[str], date: int) -> int | None:
@@ -1366,6 +1439,7 @@ class ImapServer:
                     log.warning("draft saved, but star mark failed")
                     flags = flags - {"\\Flagged"}
             self.cache.update_client_flags("500001", uid, flags | {"\\Draft"})
+            self.notify_changes("500001")
             return uid
 
     async def serve(self) -> None:
@@ -1384,11 +1458,15 @@ class ImapServer:
 
     async def _handle(self, reader, writer) -> None:
         conn = ImapConnection(self, reader, writer)
+        self._connections.add(conn)
         try:
             await conn.serve()
+        except ConnectionError:
+            log.debug("IMAP client disconnected")
         except Exception:
             log.exception("connection error")
         finally:
+            self._connections.discard(conn)
             try:
                 writer.close()
                 await writer.wait_closed()
