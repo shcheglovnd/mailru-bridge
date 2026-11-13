@@ -276,7 +276,8 @@ class SmtpSession:
         except UnsupportedMessage as exc:
             await self.send(f"554 5.6.0 {exc}")
         except ApiError as exc:
-            log.warning("send failed: %s", exc)
+            log.warning("send failed: %s (status=%s, fields=%s)",
+                        exc, exc.status, exc.validation_summary)
             await self.send("451 upstream submission failed")
         except Exception as exc:  # noqa: BLE001
             log.exception("send crashed")

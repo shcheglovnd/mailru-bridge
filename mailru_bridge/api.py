@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -56,6 +57,23 @@ class ApiError(Exception):
         super().__init__(message)
         self.status = status
         self.body = body
+
+    @property
+    def validation_summary(self) -> str:
+        """Allowlisted validation fields/codes, never upstream values or free text."""
+        details = []
+        if isinstance(self.body, dict):
+            for field, result in self.body.items():
+                if not isinstance(field, str) or not re.fullmatch(
+                    r"message_id|id|from|subject|source\.(?:reply|forward|draft)|"
+                    r"attaches\.list\[\d{1,3}\]\.(?:id|part_id|content_id|type)|"
+                    r"correspondents\.(?:to|cc|bcc)", field,
+                ):
+                    continue
+                error = result.get("error") if isinstance(result, dict) else None
+                if error in ("required", "not_exist", "not_exists", "invalid", "denied"):
+                    details.append(f"{field}={error}")
+        return ", ".join(details[:8]) or "unspecified"
 
 
 class AuthExpired(ApiError):
@@ -562,7 +580,8 @@ class MailruApi:
         for att in msg.attachments:
             att_id = await self.upload_attachment(att, message_id)
             if att.content_id:
-                attaches.append({"content_id": att.content_id, "type": "inline", "part_id": att_id})
+                # Newly uploaded inline images use id; part_id addresses an existing MIME part.
+                attaches.append({"content_id": att.content_id, "type": "inline", "id": att_id})
             else:
                 attaches.append({"id": att_id, "type": "attach"})
         body: dict[str, str] = {}

@@ -181,7 +181,7 @@ def test_attachment_uploads_share_the_composed_message_id(account, method):
         offset = len(upload_ids)
         assert json.loads(form["attaches"][0]) == {"list": [
             {"id": f"attach-{offset - 1}", "type": "attach"},
-            {"content_id": "image1", "type": "inline", "part_id": f"attach-{offset}"},
+            {"content_id": "image1", "type": "inline", "id": f"attach-{offset}"},
         ]}
         return httpx.Response(200, json={"status": 200, "body": {"id": "200"}})
 

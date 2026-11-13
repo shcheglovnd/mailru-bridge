@@ -139,3 +139,29 @@ def test_smtplib_over_local_socket():
             ["alice@example.com", "hidden@example.com"],
         )
     asyncio.run(run())
+
+
+def test_submission_failure_logs_only_safe_validation_details(caplog):
+    from mailru_bridge.api import ApiError
+
+    async def run():
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"Subject: private subject\r\n\r\nprivate body\r\n.\r\n")
+        sess = session(reader)
+        sess.s.send_message = AsyncMock(side_effect=ApiError("api/v1/messages/send: not found", 400, {
+            "attaches.list[0].id": {"error": "not_exists", "value": "private-attachment-id"},
+            "source.reply": {"error": "not_exist", "value": "private-message-id"},
+            "from": {"error": "private-error-text", "value": "private@example.com"},
+            "correspondents.to.private@example.com": {"error": "invalid", "value": "private-value"},
+            "access_token": {"error": "required", "value": "private-token"},
+        }))
+        sess.mail_started, sess.rcpts = True, ["recipient@example.com"]
+        assert await sess.smtp_data("")
+        assert b"451 upstream submission failed" in sess.writer.data
+        sess.s.send_message.assert_awaited_once()
+
+    asyncio.run(run())
+    assert "status=400" in caplog.text
+    assert "attaches.list[0].id=not_exists" in caplog.text
+    assert "source.reply=not_exist" in caplog.text
+    assert "private" not in caplog.text and "access_token" not in caplog.text

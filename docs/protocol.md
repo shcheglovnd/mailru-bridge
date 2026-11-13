@@ -185,7 +185,15 @@ Generate one client message ID before uploading. Upload each attachment with
 status 400 with a `required` field error. Use this same client message ID as `id` in the
 final send/draft request. Then `POST api/v1/messages/send` with
 form fields `correspondents` (`{"to","cc","bcc"}`), `body` (`{"html","text"}`), `attaches`
-(`{"list":[{"id","type":"attach"}|{"content_id","type":"inline","part_id"}]}`), `from`, `subject`,
+(`{"list":[{"id","type":"attach"}|{"id","content_id","type":"inline"}]}` for newly uploaded
+files), `from`, `subject`,
 `priority` (1/3/5), `receipt`, `send_date`, and optional `source` (`{"reply"|"forward"|"draft"|
 "schedule": <id>}`). Mail.ru files the sent copy in Sent itself. All `TORNADO_MPOP` commands carry
 the `access_token` in the signed query.
+
+Uploaded inline images must reference the returned upload token as `id`, with their original
+MIME Content-ID in `content_id`. The Android app's `part_id` variant refers to a MIME part from
+an existing source message; using an upload token there returns `attaches.list[n].id=not_exists`.
+Live draft save/download checks confirm the `id` form preserves Content-ID, inline disposition,
+image bytes and HTML `cid:` references. Supplying `type=attach` merely accepts the image as a
+regular attachment and loses its inline Content-ID.
