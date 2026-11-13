@@ -538,9 +538,11 @@ class MailruApi:
 
     # -- sending ---------------------------------------------------------------------------
 
-    async def upload_attachment(self, att: Attachment) -> str:
+    async def upload_attachment(self, att: Attachment, message_id: str) -> str:
         files = {"file": (att.filename or "attachment", att.content, att.content_type)}
-        body = (await self._call("api/v1/messages/attaches/add", form=[], files=files)).get("body")
+        body = (await self._call(
+            "api/v1/messages/attaches/add", form=[("message_id", message_id)], files=files,
+        )).get("body")
         try:
             return str(body["attach"]["id"])
         except (TypeError, KeyError):
@@ -554,9 +556,11 @@ class MailruApi:
         return await self._compose("api/v1/messages/draft", msg)
 
     async def _compose(self, path: str, msg: OutgoingMessage) -> Any:
+        # Uploads belong to the same client-generated id as the final send/draft request.
+        message_id = _new_message_id()
         attaches = []
         for att in msg.attachments:
-            att_id = await self.upload_attachment(att)
+            att_id = await self.upload_attachment(att, message_id)
             if att.content_id:
                 attaches.append({"content_id": att.content_id, "type": "inline", "part_id": att_id})
             else:
@@ -572,7 +576,7 @@ class MailruApi:
         if msg.bcc:
             correspondents["bcc"] = ", ".join(msg.bcc)
         form = [
-            ("id", _new_message_id()),
+            ("id", message_id),
             ("attaches", _dumps({"list": attaches})),
             ("body", _dumps(body)),
             ("correspondents", _dumps(correspondents)),

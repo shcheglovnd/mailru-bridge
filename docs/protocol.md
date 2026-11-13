@@ -179,8 +179,11 @@ needed once the raw source is available.)
 
 ### Send — from the decompile (`TornadoSendRequest`/`TornadoSendParamsImpl`)
 
-Upload each attachment with `POST api/v1/messages/attaches/add` (multipart `file`, **no**
-`md5_post_signature`) → `{"body":{"attach":{"id":…}}}`. Then `POST api/v1/messages/send` with
+Generate one client message ID before uploading. Upload each attachment with
+`POST api/v1/messages/attaches/add` (multipart `message_id=<client message ID>` and `file`,
+**no** `md5_post_signature`) → `{"body":{"attach":{"id":…}}}`. Missing `message_id` returns
+status 400 with a `required` field error. Use this same client message ID as `id` in the
+final send/draft request. Then `POST api/v1/messages/send` with
 form fields `correspondents` (`{"to","cc","bcc"}`), `body` (`{"html","text"}`), `attaches`
 (`{"list":[{"id","type":"attach"}|{"content_id","type":"inline","part_id"}]}`), `from`, `subject`,
 `priority` (1/3/5), `receipt`, `send_date`, and optional `source` (`{"reply"|"forward"|"draft"|

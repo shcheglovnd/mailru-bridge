@@ -137,3 +137,84 @@ def test_reply_and_draft_compose_preserve_remote_reference_and_return_message_id
     assert run_api(account, handle, lambda api: api.send(msg)) == {"id": "200"}
     assert run_api(account, handle, lambda api: api.save_draft(msg)) == {"id": "200"}
     assert requests == ["/api/v1/messages/send", "/api/v1/messages/draft"]
+
+
+@pytest.mark.parametrize("method", ["send", "save_draft"])
+def test_attachment_uploads_share_the_composed_message_id(account, method):
+    import json
+    from email import policy
+    from email.parser import BytesParser
+    from urllib.parse import parse_qs
+    from mailru_bridge.api import Attachment, OutgoingMessage
+
+    attachments = [
+        Attachment("report.txt", b"attachment contents\n", "text/plain"),
+        Attachment("image.png", b"\x89PNG\r\n\x00binary", "image/png", content_id="image1"),
+    ]
+    upload_ids = []
+    compose_ids = []
+
+    def handle(request):
+        if request.url.path == "/api/v1/messages/attaches/add":
+            assert "message_id" not in request.url.params
+            mime = BytesParser(policy=policy.default).parsebytes(
+                b"Content-Type: " + request.headers["content-type"].encode() + b"\r\n\r\n"
+                + request.content
+            )
+            parts = {part.get_param("name", header="content-disposition"): part
+                     for part in mime.iter_parts()}
+            assert set(parts) == {"message_id", "file"}
+            upload_ids.append(parts["message_id"].get_payload(decode=True).decode())
+            attachment = attachments[(len(upload_ids) - 1) % len(attachments)]
+            assert parts["file"].get_filename() == attachment.filename
+            assert parts["file"].get_content_type() == attachment.content_type
+            assert parts["file"].get_payload(decode=True) == attachment.content
+            return httpx.Response(200, json={"status": 200, "body": {
+                "attach": {"id": f"attach-{len(upload_ids)}"}}})
+        expected_path = "/api/v1/messages/send" if method == "send" else "/api/v1/messages/draft"
+        assert request.url.path == expected_path
+        form = parse_qs(request.content.decode())
+        message_id = form["id"][0]
+        assert len(message_id) == 32 and message_id.isalnum()
+        assert upload_ids[-2:] == [message_id, message_id]
+        compose_ids.append(message_id)
+        offset = len(upload_ids)
+        assert json.loads(form["attaches"][0]) == {"list": [
+            {"id": f"attach-{offset - 1}", "type": "attach"},
+            {"content_id": "image1", "type": "inline", "part_id": f"attach-{offset}"},
+        ]}
+        return httpx.Response(200, json={"status": 200, "body": {"id": "200"}})
+
+    msg = OutgoingMessage(sender=account.email, to=["recipient@example.com"],
+                          text="body", html='<img src="cid:image1">', attachments=attachments)
+
+    async def compose_twice(api):
+        await getattr(api, method)(msg)
+        await getattr(api, method)(msg)
+
+    run_api(account, handle, compose_twice)
+    assert len(upload_ids) == 4 and len(compose_ids) == 2
+    assert compose_ids[0] != compose_ids[1]
+
+
+@pytest.mark.parametrize("method", ["send", "save_draft"])
+@pytest.mark.parametrize("failure", ["timeout", "http500", "json400"])
+def test_failed_attachment_upload_never_submits_or_replays(account, method, failure):
+    from mailru_bridge.api import Attachment, OutgoingMessage
+    requests = []
+
+    def handle(request):
+        requests.append(request.url.path)
+        assert request.url.path == "/api/v1/messages/attaches/add"
+        if failure == "timeout":
+            raise httpx.ReadTimeout("private-upload-token", request=request)
+        if failure == "http500":
+            return httpx.Response(500)
+        return httpx.Response(200, json={"status": 400, "body": {
+            "message_id": {"value": None, "error": "required"}}})
+
+    msg = OutgoingMessage(sender=account.email, to=["recipient@example.com"], text="body",
+                          attachments=[Attachment("report.txt", b"contents")])
+    with pytest.raises(ApiError):
+        run_api(account, handle, lambda api: getattr(api, method)(msg))
+    assert requests == ["/api/v1/messages/attaches/add"]
